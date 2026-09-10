@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import time
+import math
 from functools import lru_cache
 from pathlib import Path
 import textwrap
@@ -73,9 +74,12 @@ def _find_ffmpeg() -> str:
 def _ratio(aspect_ratio: str) -> float:
     """Parse '9:16' → 9/16, '1:1' → 1.0."""
     try:
-        w, h = aspect_ratio.split(":")
-        return float(w) / float(h)
-    except (ValueError, ZeroDivisionError):
+        w, h = str(aspect_ratio or "").split(":")
+        ratio = float(w) / float(h)
+        if not math.isfinite(ratio) or ratio <= 0:
+            raise ValueError
+        return ratio
+    except (AttributeError, TypeError, ValueError, ZeroDivisionError):
         return 9.0 / 16.0
 
 
@@ -119,6 +123,57 @@ def _has_audio_stream(media_path: str) -> bool:
     return bool(re.search(r"Stream .*?: Audio:", probe.stderr or ""))
 
 
+def _has_video_stream(media_path: str) -> bool:
+    """Return whether FFmpeg can see a video stream in a media file."""
+    ffmpeg = _find_ffmpeg()
+    probe = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", media_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return bool(re.search(r"Stream .*?: Video:", probe.stderr or ""))
+
+
+def _add_silent_audio(media_path: str, out_path: str) -> str:
+    """Add a silent AAC track to a video that has no audio stream."""
+    ffmpeg = _find_ffmpeg()
+    subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            media_path,
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-shortest",
+            out_path,
+        ],
+        check=True,
+    )
+    return out_path
+
+
 def _caption_style_values(style: str, position: str = "bottom") -> Tuple[int, str, str, str, int, int, int]:
     """Return font/style values for a named caption preset."""
     presets = {
@@ -146,12 +201,17 @@ def _write_ass_captions(
 ) -> int:
     """Write an ASS subtitle file containing transcript segments in a clip."""
     font_size, primary, secondary, back, outline, border_style, alignment = _caption_style_values(caption_style, caption_position)
-    if caption_size:
-        font_size = max(18, min(120, int(caption_size)))
+    try:
+        requested_size = int(caption_size) if caption_size else 0
+    except (TypeError, ValueError):
+        requested_size = 0
+    if requested_size:
+        font_size = max(18, min(120, requested_size))
     if caption_color:
-        raw = caption_color.lstrip("#")
-        if len(raw) == 6:
+        raw = str(caption_color).lstrip("#")
+        if re.fullmatch(r"[0-9A-Fa-f]{6}", raw):
             primary = f"&H00{raw[4:6]}{raw[2:4]}{raw[0:2]}"
+    safe_font = re.sub(r"[\r\n,]", " ", str(caption_font or "Arial")).strip()[:80] or "Arial"
     header = [
         "[Script Info]",
         "ScriptType: v4.00+",
@@ -162,7 +222,7 @@ def _write_ass_captions(
         "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Default,{caption_font or 'Arial'},{font_size},{primary},{secondary},&H00000000,{back},-1,0,0,0,100,100,0,0,{border_style},{outline},2,{alignment},72,72,170,1",
+        f"Style: Default,{safe_font},{font_size},{primary},{secondary},&H00000000,{back},-1,0,0,0,100,100,0,0,{border_style},{outline},2,{alignment},72,72,170,1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -517,6 +577,16 @@ def crop_clip_local(
     jump_cuts: bool = False,
 ) -> str:
     """Cut + reframe one highlight, optionally burning Whisper captions."""
+    for label, media in (
+        ("background music", background_music),
+        ("watermark", watermark),
+        ("intro", intro),
+        ("outro", outro),
+    ):
+        if media and not os.path.isfile(media):
+            raise RuntimeError(f"{label} file not found: {media}")
+    if background_music and not _has_audio_stream(background_music):
+        raise RuntimeError(f"background music file has no audio stream: {background_music}")
     cut_path = out_path + ".cut.mp4"
     base_path = out_path + ".base.mp4"
     try:
@@ -592,8 +662,6 @@ def crop_clip_local(
             maps = []
             input_index = 1
             if background_music:
-                if not os.path.isfile(background_music):
-                    raise RuntimeError(f"background music file not found: {background_music}")
                 inputs += ["-stream_loop", "-1", "-i", background_music]
                 if _has_audio_stream(out_path):
                     filters.append(f"[0:a][{input_index}:a]amix=inputs=2:duration=first:dropout_transition=2[a]")
@@ -604,8 +672,6 @@ def crop_clip_local(
                 maps.append("[a]")
                 input_index += 1
             if watermark:
-                if not os.path.isfile(watermark):
-                    raise RuntimeError(f"watermark image not found: {watermark}")
                 inputs += ["-i", watermark]
                 filters.append(f"[0:v][{input_index}:v]overlay=W-w-24:H-h-24[v]")
                 maps.insert(0, "[v]")
@@ -633,23 +699,49 @@ def crop_clip_local(
         for label, media in (("intro", intro), ("clip", out_path), ("outro", outro)):
             if not media:
                 continue
-            if label != "clip" and not os.path.isfile(media):
-                raise RuntimeError(f"{label} file not found: {media}")
             segments.append(media)
         if len(segments) > 1:
             branded = out_path + ".branded.mp4"
+            concat_inputs = []
+            silent_audio_paths = []
             try:
                 ffmpeg = _find_ffmpeg()
                 args = [ffmpeg, "-y", "-loglevel", "error"]
-                for media in segments:
-                    args += ["-i", media]
-                concat = "".join(f"[{i}:v:0][{i}:a:0]" for i in range(len(segments)))
-                args += ["-filter_complex", f"{concat}concat=n={len(segments)}:v=1:a=1[v][a]", "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-c:a", "aac", "-b:a", "128k", branded]
+                for index, media in enumerate(segments):
+                    if not _has_video_stream(media):
+                        raise RuntimeError(f"{media} does not contain a video stream")
+                    concat_media = media
+                    if not _has_audio_stream(media):
+                        concat_media = f"{out_path}.concat_{index}.mp4"
+                        silent_audio_paths.append(concat_media)
+                        _add_silent_audio(media, concat_media)
+                    concat_inputs.append(concat_media)
+                    args += ["-i", concat_media]
+                # Intro/outro files commonly have different dimensions from
+                # the generated vertical clip. Normalize every video stream
+                # to the selected output canvas before concatenating.
+                concat_h = 1920
+                concat_w = max(2, int(round(concat_h * _ratio(aspect_ratio))) // 2 * 2)
+                normalized = []
+                for i in range(len(concat_inputs)):
+                    normalized.append(
+                        f"[{i}:v:0]scale={concat_w}:{concat_h}:force_original_aspect_ratio=decrease,"
+                        f"pad={concat_w}:{concat_h}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}];"
+                        f"[{i}:a:0]aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a{i}]"
+                    )
+                concat = "".join(f"[v{i}][a{i}]" for i in range(len(concat_inputs)))
+                filter_complex = ";".join(normalized + [
+                    f"{concat}concat=n={len(concat_inputs)}:v=1:a=1[v][a]"
+                ])
+                args += ["-filter_complex", filter_complex, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-c:a", "aac", "-b:a", "128k", branded]
                 subprocess.run(args, check=True)
                 os.replace(branded, out_path)
             finally:
                 if os.path.exists(branded):
                     _remove_with_retry(branded)
+                for silent_audio_path in silent_audio_paths:
+                    if os.path.exists(silent_audio_path):
+                        _remove_with_retry(silent_audio_path)
     return out_path
 
 
@@ -723,14 +815,28 @@ def crop_highlights_local(
     for i, h in enumerate(highlights, 1):
         out_path = os.path.join(out_dir, f"short_{i:02d}.mp4")
         print(f"[clip/local] {i}/{len(highlights)}: {h.get('title', '(untitled)')}", flush=True)
+        preexisting_output = os.path.isfile(out_path)
+        try:
+            start_time = float(h["start_time"])
+            end_time = float(h["end_time"])
+        except (KeyError, TypeError, ValueError) as exc:
+            message = f"invalid highlight timestamps: {exc}"
+            print(f"[clip/local] {i} failed: {message}", flush=True)
+            results.append({**h, "clip_url": None, "error": message})
+            continue
+        if end_time <= start_time:
+            message = "invalid highlight timestamps: end_time must be after start_time"
+            print(f"[clip/local] {i} failed: {message}", flush=True)
+            results.append({**h, "clip_url": None, "error": message})
+            continue
         captions_for_clip = burn_captions and _has_caption_window(
-            float(h["start_time"]), float(h["end_time"]), caption_segments
+            start_time, end_time, caption_segments
         )
         try:
             crop_clip_local(
                 source_path,
-                float(h["start_time"]),
-                float(h["end_time"]),
+                start_time,
+                end_time,
                 aspect_ratio,
                 out_path,
                 caption_segments=caption_segments,
@@ -759,7 +865,7 @@ def crop_highlights_local(
                 thumbnail_path = os.path.join(out_dir, f"short_{i:02d}.jpg")
                 extract_thumbnail(
                     source_path,
-                    (float(h["start_time"]) + float(h["end_time"])) / 2.0,
+                    (start_time + end_time) / 2.0,
                     thumbnail_path,
                     text=h.get("hook_sentence") or h.get("title") or "",
                 )
@@ -771,5 +877,10 @@ def crop_highlights_local(
             results.append(item)
         except Exception as e:
             print(f"[clip/local] {i} failed: {e}", flush=True)
+            if not preexisting_output and os.path.isfile(out_path):
+                try:
+                    _remove_with_retry(out_path)
+                except OSError:
+                    pass
             results.append({**h, "clip_url": None, "error": str(e)})
     return results

@@ -1,3 +1,5 @@
+import json
+import math
 import os
 
 from dotenv import load_dotenv
@@ -7,8 +9,19 @@ load_dotenv()
 MUAPI_API_KEY = os.getenv("MUAPI_API_KEY", "").strip()
 MUAPI_BASE_URL = os.getenv("MUAPI_BASE_URL", "https://api.muapi.ai/api/v1").rstrip("/")
 
-POLL_INTERVAL_SECONDS = float(os.getenv("MUAPI_POLL_INTERVAL", "5"))
-POLL_TIMEOUT_SECONDS = float(os.getenv("MUAPI_POLL_TIMEOUT", "600"))
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    """Read a positive finite float without letting a bad .env crash startup."""
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+POLL_INTERVAL_SECONDS = _positive_float_env("MUAPI_POLL_INTERVAL", 5.0)
+POLL_TIMEOUT_SECONDS = _positive_float_env("MUAPI_POLL_TIMEOUT", 600.0)
 
 # Local-mode (--mode local) settings — only consulted when running offline.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -58,8 +71,17 @@ def gpu_status() -> dict:
 LOCAL_WHISPER_VAD_FILTER = os.getenv("LOCAL_WHISPER_VAD_FILTER", "false").strip().lower() == "true"
 _vad_params_env = os.getenv("LOCAL_WHISPER_VAD_PARAMETERS", "")
 if _vad_params_env:
-    import json
-    LOCAL_WHISPER_VAD_PARAMETERS = json.loads(_vad_params_env)
+    try:
+        parsed_vad = json.loads(_vad_params_env)
+    except (TypeError, ValueError):
+        parsed_vad = None
+    LOCAL_WHISPER_VAD_PARAMETERS = parsed_vad if isinstance(parsed_vad, dict) else {
+        "threshold": 0.5,
+        "min_speech_duration_ms": 250,
+        "max_speech_duration_s": float("inf"),
+        "min_silence_duration_ms": 2000,
+        "speech_pad_ms": 400,
+    }
 else:
     # Match faster-whisper defaults when VAD is enabled
     LOCAL_WHISPER_VAD_PARAMETERS = {

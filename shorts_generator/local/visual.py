@@ -23,30 +23,32 @@ def analyze_video(media_path: str, sample_seconds: float = 1.0) -> List[Dict]:
     previous = None
     events: List[Dict] = []
     frame_index = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if frame_index % step:
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame_index % step:
+                frame_index += 1
+                continue
+            timestamp = frame_index / fps
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            small = cv2.resize(gray, (160, 90))
+            face_count = len(cascade.detectMultiScale(gray, 1.1, 5, minSize=(35, 35)))
+            if previous is not None:
+                change = float(cv2.absdiff(small, previous).mean())
+                if change >= 24.0:
+                    events.append({"time": round(timestamp, 2), "type": "scene_change", "score": round(min(1.0, change / 80.0), 3)})
+            if face_count >= 2:
+                events.append({"time": round(timestamp, 2), "type": "multiple_speakers", "score": min(1.0, face_count / 4.0)})
+            elif face_count == 1:
+                events.append({"time": round(timestamp, 2), "type": "speaker_visible", "score": 0.35})
+            previous = small
             frame_index += 1
-            continue
-        timestamp = frame_index / fps
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        small = cv2.resize(gray, (160, 90))
-        face_count = len(cascade.detectMultiScale(gray, 1.1, 5, minSize=(35, 35)))
-        if previous is not None:
-            change = float(cv2.absdiff(small, previous).mean())
-            if change >= 24.0:
-                events.append({"time": round(timestamp, 2), "type": "scene_change", "score": round(min(1.0, change / 80.0), 3)})
-        if face_count >= 2:
-            events.append({"time": round(timestamp, 2), "type": "multiple_speakers", "score": min(1.0, face_count / 4.0)})
-        elif face_count == 1:
-            events.append({"time": round(timestamp, 2), "type": "speaker_visible", "score": 0.35})
-        previous = small
-        frame_index += 1
-        if duration and timestamp >= duration:
-            break
-    cap.release()
+            if duration and timestamp >= duration:
+                break
+    finally:
+        cap.release()
     return events
 
 

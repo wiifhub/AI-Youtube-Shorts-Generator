@@ -50,7 +50,19 @@ app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 _jobs: Dict[str, Dict[str, Any]] = {}
 _lock = threading.Lock()
 _cancel_events: Dict[str, threading.Event] = {}
-_job_slots = threading.Semaphore(max(1, int(os.getenv("SHORTS_MAX_CONCURRENT_JOBS", "2"))))
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer without letting a malformed .env break startup."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(1, value)
+
+
+_max_concurrent_jobs = _positive_int_env("SHORTS_MAX_CONCURRENT_JOBS", 2)
+_job_slots = threading.Semaphore(_max_concurrent_jobs)
 _output_root = Path(LOCAL_OUTPUT_DIR).expanduser().resolve()
 _jobs_dir = _output_root / "jobs"
 _uploads_dir = _output_root / "uploads"
@@ -64,7 +76,8 @@ _allowed_upload_extensions = {
     ".mpg",
     ".webm",
 }
-_max_upload_bytes = int(os.getenv("SHORTS_MAX_UPLOAD_MB", "2048")) * 1024 * 1024
+_max_upload_mb = _positive_int_env("SHORTS_MAX_UPLOAD_MB", 2048)
+_max_upload_bytes = _max_upload_mb * 1024 * 1024
 
 
 def _job_path(job_id: str) -> Path:
@@ -497,15 +510,14 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
                 _jobs_dir / job_id / f"short_{index + 1:02d}.mp4"
             )
             undo_path = out_path + ".undo.mp4"
-            if os.path.isfile(out_path):
-                shutil.copyfile(out_path, undo_path)
+            render_path = out_path + ".regenerate.mp4"
             Path(out_path).parent.mkdir(parents=True, exist_ok=True)
             crop_clip_local(
                 str(source),
                 update.start_time,
                 update.end_time,
                 str(request.get("aspect_ratio") or "9:16"),
-                out_path,
+                render_path,
                 caption_segments=list(transcript.get("segments") or []),
                 burn_captions=LOCAL_BURN_CAPTIONS,
                 caption_style=style,
@@ -528,6 +540,13 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
                 outro=request.get("outro") or None,
                 jump_cuts=bool(request.get("jump_cuts")),
             )
+            if not os.path.isfile(render_path):
+                raise RuntimeError("clip renderer did not produce an output file")
+            # Keep the current clip and its previous undo snapshot untouched
+            # until the replacement render has completed successfully.
+            if os.path.isfile(out_path):
+                shutil.copyfile(out_path, undo_path)
+            os.replace(render_path, out_path)
             replacement = {
                 **old,
                 "start_time": update.start_time,
@@ -545,6 +564,11 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
                 "layout": update.layout,
             }
             replacement["undo_path"] = undo_path if os.path.isfile(undo_path) else None
+            replacement["undo_metadata"] = {
+                key: value
+                for key, value in old.items()
+                if key not in {"undo_path", "undo_metadata"}
+            }
             try:
                 from shorts_generator.local.visual import extract_thumbnail
 
@@ -581,6 +605,13 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception as exc:
+        if mode == "local":
+            render_path = locals().get("render_path")
+            if render_path and os.path.isfile(render_path):
+                try:
+                    os.remove(render_path)
+                except OSError:
+                    pass
         raise HTTPException(500, f"could not regenerate clip: {exc}") from exc
 
     with _lock:
@@ -614,8 +645,11 @@ def undo_clip(job_id: str, index: int) -> Dict[str, Any]:
         if not undo_path or not os.path.isfile(undo_path) or not clip_path:
             raise HTTPException(400, "no previous clip version is available")
         shutil.copyfile(undo_path, clip_path)
-        item.pop("undo_path", None)
-        shorts[index] = item
+        restored = dict(item.get("undo_metadata") or item)
+        restored["clip_url"] = clip_path
+        restored.pop("undo_path", None)
+        restored.pop("undo_metadata", None)
+        shorts[index] = restored
         job["raw_shorts"] = shorts
         if job.get("result"):
             job["result"]["shorts"] = _public_shorts(shorts, job_id)
@@ -719,6 +753,7 @@ def preview_clip(job_id: str, update: ClipUpdate) -> Dict[str, Any]:
         request = dict(job.get("request") or {})
         source = job.get("raw_source_video_url")
         transcript = dict(job.get("raw_transcript") or {})
+        output_dir = str(job.get("output_dir") or (_jobs_dir / job_id))
     if not source or not Path(str(source)).is_file():
         raise HTTPException(400, "a completed local job is required for preview")
     duration = float(transcript.get("duration") or 0.0)
@@ -730,27 +765,52 @@ def preview_clip(job_id: str, update: ClipUpdate) -> Dict[str, Any]:
     if style not in {"clean", "bold", "boxed", "karaoke"}:
         raise HTTPException(400, "caption_style must be clean, bold, boxed, or karaoke")
     from shorts_generator.local.clipper import crop_clip_local
-    preview = _jobs_dir / job_id / "preview.mp4"
-    crop_clip_local(
-        str(source), update.start_time, update.end_time,
-        str(request.get("aspect_ratio") or "9:16"), str(preview),
-        caption_segments=list(transcript.get("segments") or []),
-        burn_captions=LOCAL_BURN_CAPTIONS,
-        caption_style=style,
-        caption_position=update.caption_position,
-        caption_font=update.caption_font,
-        caption_size=update.caption_size,
-        caption_color=update.caption_color,
-        auto_reframe=bool(request.get("auto_reframe", True)),
-        crop_position=update.crop_position, fit_mode=update.fit_mode, zoom=update.zoom,
-        layout=update.layout,
-    )
+    preview = Path(output_dir) / "preview.mp4"
+    preview.parent.mkdir(parents=True, exist_ok=True)
+    render_path = preview.with_name("preview.render.mp4")
+    try:
+        crop_clip_local(
+            str(source), update.start_time, update.end_time,
+            str(request.get("aspect_ratio") or "9:16"), str(render_path),
+            caption_segments=list(transcript.get("segments") or []),
+            burn_captions=LOCAL_BURN_CAPTIONS,
+            caption_style=style,
+            caption_position=update.caption_position,
+            caption_font=update.caption_font,
+            caption_size=update.caption_size,
+            caption_color=update.caption_color,
+            remove_silence=bool(request.get("remove_silence")),
+            normalize_audio=bool(request.get("normalize_audio")),
+            denoise_audio=bool(request.get("denoise_audio")),
+            remove_filler_words=bool(request.get("remove_filler_words")),
+            background_music=request.get("background_music") or None,
+            watermark=request.get("watermark") or None,
+            auto_reframe=bool(request.get("auto_reframe", True)),
+            crop_position=update.crop_position, fit_mode=update.fit_mode, zoom=update.zoom,
+            layout=update.layout,
+            intro=request.get("intro") or None,
+            outro=request.get("outro") or None,
+            jump_cuts=bool(request.get("jump_cuts")),
+        )
+        if not render_path.is_file():
+            raise RuntimeError("preview renderer did not produce an output file")
+        os.replace(render_path, preview)
+    finally:
+        if render_path.is_file():
+            try:
+                render_path.unlink()
+            except OSError:
+                pass
     return {"preview_url": f"/api/jobs/{job_id}/preview.mp4", "path": str(preview)}
 
 
 @app.get("/api/jobs/{job_id}/preview.mp4")
 def get_preview(job_id: str):
-    path = _jobs_dir / job_id / "preview.mp4"
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "job not found")
+        path = Path(str(job.get("output_dir") or (_jobs_dir / job_id))) / "preview.mp4"
     if not path.is_file():
         raise HTTPException(404, "preview not found")
     return FileResponse(path, media_type="video/mp4", filename=path.name)
@@ -855,7 +915,7 @@ def system_status() -> Dict[str, Any]:
         "whisper_devices": ["auto", "cpu", "cuda"],
         "captions_enabled": LOCAL_BURN_CAPTIONS,
         "free_disk_gb": round(usage.free / (1024 ** 3), 2),
-        "max_concurrent_jobs": max(1, int(os.getenv("SHORTS_MAX_CONCURRENT_JOBS", "2"))),
+        "max_concurrent_jobs": _max_concurrent_jobs,
     }
 
 
