@@ -23,16 +23,31 @@ LOCAL_BURN_CAPTIONS = os.getenv("LOCAL_BURN_CAPTIONS", "true").strip().lower() =
 
 
 def gpu_status() -> dict:
-    """Return safe CUDA availability details for the UI without importing Whisper."""
-    status = {"cuda_available": False, "device_name": None, "reason": "PyTorch not installed"}
+    """Return safe CUDA availability details for the UI."""
+    status = {"cuda_available": False, "device_name": None, "reason": "CUDA runtime unavailable"}
     try:
         import torch  # type: ignore
         if torch.cuda.is_available():
             status.update(cuda_available=True, device_name=torch.cuda.get_device_name(0), reason="ready")
         else:
-            status["reason"] = "CUDA runtime unavailable"
-    except Exception as exc:
-        status["reason"] = str(exc)
+            status["reason"] = "PyTorch CUDA unavailable"
+    except Exception:
+        status["reason"] = "PyTorch not installed"
+    if not status["cuda_available"]:
+        try:
+            import ctranslate2  # type: ignore
+            count = int(ctranslate2.get_cuda_device_count())
+            if count > 0:
+                status.update(
+                    cuda_available=True,
+                    device_name=f"CUDA device ({count} available)",
+                    reason="ready via CTranslate2",
+                )
+            elif status["reason"] == "PyTorch not installed":
+                status["reason"] = "No CUDA device detected"
+        except Exception as exc:
+            if status["reason"] == "PyTorch not installed":
+                status["reason"] = str(exc)
     return status
 
 # VAD (Voice Activity Detection) settings for faster-whisper

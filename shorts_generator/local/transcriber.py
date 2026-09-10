@@ -12,6 +12,22 @@ from typing import Dict, Optional
 from ..config import LOCAL_OUTPUT_DIR, LOCAL_WHISPER_DEVICE, LOCAL_WHISPER_MODEL
 
 
+def _cuda_ready() -> bool:
+    """Check CUDA through PyTorch or CTranslate2, whichever is installed."""
+    try:
+        import torch  # type: ignore
+        if torch.cuda.is_available():
+            torch.zeros(1, device="cuda")
+            return True
+    except (ImportError, OSError, RuntimeError):
+        pass
+    try:
+        import ctranslate2  # type: ignore
+        return int(ctranslate2.get_cuda_device_count()) > 0
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
 def _transcript_cache_path(media_path: str, cache_dir: Optional[str] = None) -> Path:
     """Return the .srt cache path for a media file."""
     target_dir = Path(cache_dir or LOCAL_OUTPUT_DIR)
@@ -97,26 +113,13 @@ def _resolve_device(requested: Optional[str] = None) -> str:
     if requested not in {"auto", "cpu", "cuda"}:
         raise ValueError("Whisper device must be auto, cpu, or cuda")
     if requested == "cuda":
-        try:
-            import torch  # type: ignore
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA was selected, but PyTorch cannot access an NVIDIA CUDA device")
-            torch.zeros(1, device="cuda")
-        except ImportError as exc:
-            raise RuntimeError("CUDA was selected, but PyTorch is not installed. Run install_gpu_windows.bat first") from exc
-        except (OSError, RuntimeError) as exc:
-            raise RuntimeError(f"CUDA was selected but is not usable: {exc}") from exc
+        if not _cuda_ready():
+            raise RuntimeError("CUDA was selected, but no usable CUDA device was detected. Install a current NVIDIA driver or run install_gpu_windows.bat")
         return "cuda"
     if requested != "auto":
         return requested
-    try:
-        import torch  # type: ignore
-        if torch.cuda.is_available():
-            # Test that CUDA actually works (catches missing cuBLAS/cuDNN libs)
-            torch.zeros(1, device="cuda")
-            return "cuda"
-    except (ImportError, OSError, RuntimeError):
-        pass
+    if _cuda_ready():
+        return "cuda"
     return "cpu"
 
 

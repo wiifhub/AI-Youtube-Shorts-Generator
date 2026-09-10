@@ -126,7 +126,7 @@ Open [http://127.0.0.1:7860](http://127.0.0.1:7860). Paste a YouTube URL, choose
 
 ### GPU acceleration (Windows)
 
-The web UI exposes Whisper model and device controls. `Auto` detects a usable CUDA device and otherwise falls back to CPU; `CPU` is the compatible fallback; `CUDA GPU` requires an NVIDIA driver, CUDA runtime, and a CUDA-enabled PyTorch install. After running `install_windows.bat`, run `install_gpu_windows.bat` to install the CUDA PyTorch wheel, restart Shorts Studio, and choose **CUDA GPU**. The status line at the top reports whether CUDA is available. The `requirements-gpu.txt` file documents the optional GPU dependency.
+The web UI exposes Whisper model and device controls. `Auto` detects a usable CUDA device through CTranslate2 and otherwise falls back to CPU; `CPU` is the compatible fallback; `CUDA GPU` requires a current NVIDIA driver and a CUDA-capable CTranslate2 build. The portable release bundles the CTranslate2 runtime and reports the detected CUDA device in the status line. For source installs, run `install_gpu_windows.bat` if you also want the CUDA-enabled PyTorch diagnostics package; then restart Shorts Studio and choose **CUDA GPU**. The `requirements-gpu.txt` file documents that optional dependency.
 
 ### Professional Windows installer
 
