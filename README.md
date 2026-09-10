@@ -111,6 +111,10 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
 
 On Windows, from the downloaded/cloned project folder, double-click `install_windows.bat` once. It creates the virtual environment, installs all dependencies, and creates `.env` from `.env.example`. Then double-click `start_studio.bat` (or run `python -m web.app` inside the activated environment).
 
+### Portable Windows executable
+
+Download `ShortsStudio-v0.3.0-windows.zip` from the Releases page and extract the entire ZIP. Open the `ShortsStudio` folder and double-click `ShortsStudio.exe`; it starts the local server and opens the browser automatically. Keep the whole folder together because it includes the runtime and FFmpeg binaries. Configure API keys in a `.env` file beside the executable when using local LLM ranking.
+
 Install deps, then:
 
 ```bash
