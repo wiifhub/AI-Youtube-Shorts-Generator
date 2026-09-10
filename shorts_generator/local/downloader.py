@@ -118,6 +118,9 @@ def download_youtube_local(video_url: str, fmt: str = "720", out_dir: Optional[s
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
+        "retries": 3,
+        "fragment_retries": 3,
+        "file_access_retries": 3,
         # YouTube now requires solving a JS "n" challenge to unlock most
         # formats. Without a JS runtime + solver script, yt-dlp reports
         # perfectly-playable videos as "not available". See:

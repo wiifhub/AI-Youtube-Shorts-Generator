@@ -50,7 +50,7 @@ def analyze_video(media_path: str, sample_seconds: float = 1.0) -> List[Dict]:
     return events
 
 
-def extract_thumbnail(media_path: str, timestamp: float, out_path: str) -> str:
+def extract_thumbnail(media_path: str, timestamp: float, out_path: str, text: str = "") -> str:
     """Extract a high-quality JPG frame for a short's thumbnail."""
     try:
         import cv2  # type: ignore
@@ -64,6 +64,14 @@ def extract_thumbnail(media_path: str, timestamp: float, out_path: str) -> str:
     cap.release()
     if not ok:
         raise RuntimeError(f"could not read thumbnail frame at {timestamp:.1f}s")
+    if text:
+        import textwrap
+        lines = textwrap.wrap(" ".join(str(text).split()), width=22)[:3]
+        y = max(60, frame.shape[0] - 80 * len(lines))
+        for line in lines:
+            cv2.putText(frame, line, (32, y), cv2.FONT_HERSHEY_DUPLEX, 1.4, (0, 0, 0), 8, cv2.LINE_AA)
+            cv2.putText(frame, line, (32, y), cv2.FONT_HERSHEY_DUPLEX, 1.4, (255, 255, 255), 2, cv2.LINE_AA)
+            y += 72
     if not cv2.imwrite(str(out_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
         raise RuntimeError(f"could not write thumbnail {out_path}")
     return out_path

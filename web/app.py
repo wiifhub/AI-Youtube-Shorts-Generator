@@ -121,6 +121,9 @@ class JobRequest(BaseModel):
     denoise_audio: bool = False
     remove_filler_words: bool = False
     caption_position: str = "bottom"
+    caption_font: str = "Arial"
+    caption_size: int = Field(0, ge=0, le=120)
+    caption_color: Optional[str] = None
     focus: str = "balanced"
     background_music: Optional[str] = None
     watermark: Optional[str] = None
@@ -130,6 +133,8 @@ class JobRequest(BaseModel):
     zoom: float = Field(1.0, ge=0.5, le=1.5)
     intro: Optional[str] = None
     outro: Optional[str] = None
+    jump_cuts: bool = False
+    layout: str = "single"
     save_folder: Optional[str] = None
 
 
@@ -142,9 +147,18 @@ class ClipUpdate(BaseModel):
     start_time: float = Field(..., ge=0)
     end_time: float = Field(..., gt=0)
     caption_style: Optional[str] = None
+    caption_position: str = "bottom"
+    caption_font: str = "Arial"
+    caption_size: int = Field(0, ge=0, le=120)
+    caption_color: Optional[str] = None
     crop_position: float = Field(0.5, ge=0.0, le=1.0)
     zoom: float = Field(1.0, ge=0.5, le=1.5)
     fit_mode: str = "crop"
+    layout: str = "single"
+
+
+class ProjectUpdate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
 
 
 def _job_snapshot(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -245,6 +259,9 @@ def _run_job(job_id: str, req: JobRequest) -> None:
             denoise_audio=req.denoise_audio,
             remove_filler_words=req.remove_filler_words,
             caption_position=req.caption_position,
+            caption_font=req.caption_font,
+            caption_size=req.caption_size,
+            caption_color=req.caption_color,
             focus=req.focus,
             background_music=req.background_music,
             watermark=req.watermark,
@@ -254,6 +271,8 @@ def _run_job(job_id: str, req: JobRequest) -> None:
             zoom=req.zoom,
             intro=req.intro,
             outro=req.outro,
+            jump_cuts=req.jump_cuts,
+            layout=req.layout,
             save_folder=req.save_folder,
         )
         public = {
@@ -327,6 +346,9 @@ def _enqueue_job(req: JobRequest) -> Dict[str, Any]:
                 "denoise_audio": req.denoise_audio,
                 "remove_filler_words": req.remove_filler_words,
                 "caption_position": req.caption_position,
+                "caption_font": req.caption_font,
+                "caption_size": req.caption_size,
+                "caption_color": req.caption_color,
                 "focus": req.focus,
                 "background_music": req.background_music,
                 "watermark": req.watermark,
@@ -336,6 +358,8 @@ def _enqueue_job(req: JobRequest) -> Dict[str, Any]:
                 "zoom": req.zoom,
                 "intro": req.intro,
                 "outro": req.outro,
+                "jump_cuts": req.jump_cuts,
+                "layout": req.layout,
                 "save_folder": req.save_folder,
             },
         }
@@ -372,6 +396,9 @@ def create_batch_jobs(req: BatchRequest) -> Dict[str, Any]:
             denoise_audio=req.denoise_audio,
             remove_filler_words=req.remove_filler_words,
             caption_position=req.caption_position,
+            caption_font=req.caption_font,
+            caption_size=req.caption_size,
+            caption_color=req.caption_color,
             focus=req.focus,
             background_music=req.background_music,
             watermark=req.watermark,
@@ -381,6 +408,8 @@ def create_batch_jobs(req: BatchRequest) -> Dict[str, Any]:
             zoom=req.zoom,
             intro=req.intro,
             outro=req.outro,
+            jump_cuts=req.jump_cuts,
+            layout=req.layout,
         )
         jobs.append(_enqueue_job(item))
     if not jobs:
@@ -410,6 +439,17 @@ def list_jobs() -> Dict[str, Any]:
     with _lock:
         jobs = [_job_snapshot(j) for j in sorted(_jobs.values(), key=lambda x: x["created_at"], reverse=True)]
     return {"jobs": jobs[:20]}
+
+
+@app.patch("/api/jobs/{job_id}")
+def rename_job(job_id: str, update: ProjectUpdate) -> Dict[str, Any]:
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "job not found")
+        job["name"] = " ".join(update.name.split())
+        _persist_job_locked(job)
+        return _job_snapshot(job)
 
 
 @app.post("/api/jobs/{job_id}/clips/{index}")
@@ -461,15 +501,20 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
                 normalize_audio=bool(request.get("normalize_audio")),
                 denoise_audio=bool(request.get("denoise_audio")),
                 remove_filler_words=bool(request.get("remove_filler_words")),
-                caption_position=str(request.get("caption_position") or "bottom"),
+                caption_position=update.caption_position,
+                caption_font=update.caption_font,
+                caption_size=update.caption_size,
+                caption_color=update.caption_color,
                 background_music=request.get("background_music") or None,
                 watermark=request.get("watermark") or None,
                 auto_reframe=bool(request.get("auto_reframe", True)),
                 crop_position=update.crop_position,
                 fit_mode=update.fit_mode,
                 zoom=update.zoom,
+                layout=update.layout,
                 intro=request.get("intro") or None,
                 outro=request.get("outro") or None,
+                jump_cuts=bool(request.get("jump_cuts")),
             )
             replacement = {
                 **old,
@@ -564,6 +609,9 @@ def export_job(job_id: str):
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
         bundle.writestr("metadata.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        bundle.writestr("publishing/youtube_shorts.json", json.dumps({"platform": "youtube_shorts", "items": [s["creator_metadata"] for s in manifest["shorts"]]}, ensure_ascii=False, indent=2))
+        bundle.writestr("publishing/tiktok.json", json.dumps({"platform": "tiktok", "items": [s["creator_metadata"] for s in manifest["shorts"]]}, ensure_ascii=False, indent=2))
+        bundle.writestr("publishing/instagram_reels.json", json.dumps({"platform": "instagram_reels", "items": [s["creator_metadata"] for s in manifest["shorts"]]}, ensure_ascii=False, indent=2))
         for index, short in enumerate(raw_shorts, 1):
             path = str(short.get("clip_url") or "")
             if path and not path.startswith("http") and Path(path).is_file():
@@ -629,8 +677,12 @@ def preview_clip(job_id: str, update: ClipUpdate) -> Dict[str, Any]:
         burn_captions=LOCAL_BURN_CAPTIONS,
         caption_style=update.caption_style or str(request.get("caption_style") or "bold"),
         caption_position=str(request.get("caption_position") or "bottom"),
+        caption_font=str(request.get("caption_font") or "Arial"),
+        caption_size=int(request.get("caption_size") or 0),
+        caption_color=request.get("caption_color") or None,
         auto_reframe=bool(request.get("auto_reframe", True)),
         crop_position=update.crop_position, fit_mode=update.fit_mode, zoom=update.zoom,
+        layout=update.layout,
     )
     return {"preview_url": f"/api/jobs/{job_id}/preview.mp4", "path": str(preview)}
 
@@ -740,6 +792,24 @@ def system_status() -> Dict[str, Any]:
         "captions_enabled": LOCAL_BURN_CAPTIONS,
         "free_disk_gb": round(usage.free / (1024 ** 3), 2),
         "max_concurrent_jobs": max(1, int(os.getenv("SHORTS_MAX_CONCURRENT_JOBS", "2"))),
+    }
+
+
+@app.get("/api/diagnostics")
+def diagnostics() -> Dict[str, Any]:
+    ffmpeg = shutil.which("ffmpeg")
+    with _lock:
+        counts = {}
+        for job in _jobs.values():
+            counts[job.get("status", "unknown")] = counts.get(job.get("status", "unknown"), 0) + 1
+    return {
+        "python": sys.version,
+        "ffmpeg_path": ffmpeg,
+        "ffmpeg_ready": bool(ffmpeg),
+        "output_root": str(_output_root),
+        "free_disk_gb": round(shutil.disk_usage(_output_root).free / (1024 ** 3), 2),
+        "job_counts": counts,
+        "captions_enabled": LOCAL_BURN_CAPTIONS,
     }
 
 

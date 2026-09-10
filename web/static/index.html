@@ -213,6 +213,9 @@
             </select>
             <label>Caption position</label>
             <select name="caption_position"><option value="bottom" selected>Bottom</option><option value="center">Center</option><option value="top">Top</option></select>
+            <input name="caption_font" value="Arial" placeholder="Caption font" />
+            <input name="caption_size" type="number" min="0" max="120" value="0" placeholder="Font size" />
+            <input name="caption_color" type="color" value="#FFFFFF" title="Caption color" />
           </div>
           <div>
             <label>Highlight focus</label>
@@ -229,10 +232,13 @@
         <div class="checks">
           <label class="check"><input type="checkbox" name="auto_reframe" checked /> Auto frame faces</label>
           <label class="check"><input type="checkbox" name="remove_silence" /> Trim long silent audio</label>
+          <label class="check"><input type="checkbox" name="jump_cuts" /> Remove silent video sections (jump cuts)</label>
           <label class="check"><input type="checkbox" name="normalize_audio" /> Normalize loudness</label>
           <label class="check"><input type="checkbox" name="denoise_audio" /> Reduce background noise</label>
           <label class="check"><input type="checkbox" name="remove_filler_words" /> Remove common filler words from captions</label>
         </div>
+        <label>Speaker layout</label>
+        <select name="layout"><option value="single" selected>Single frame</option><option value="split">Two-panel split layout</option></select>
         <label>Manual crop position <span id="cropPositionLabel">Center</span></label>
         <input name="crop_position" id="cropPosition" type="range" min="0" max="1" step="0.01" value="0.5" />
         <label>Framing style</label>
@@ -570,7 +576,7 @@
         const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/clips/${index}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ start_time: start, end_time: end, caption_style: form.elements.caption_style.value, caption_position: form.elements.caption_position.value, fit_mode: fitMode, crop_position: cropPosition, zoom: zoomValue }),
+          body: JSON.stringify({ start_time: start, end_time: end, caption_style: form.elements.caption_style.value, caption_position: form.elements.caption_position.value, caption_font: form.elements.caption_font.value, caption_size: Number(form.elements.caption_size.value || 0), caption_color: form.elements.caption_color.value, fit_mode: fitMode, crop_position: cropPosition, zoom: zoomValue, layout: form.elements.layout.value }),
         });
         const job = await response.json();
         if (!response.ok) throw new Error(job.detail || "Could not regenerate clip");
@@ -631,6 +637,8 @@
       data.url = String(data.url || "").trim();
       data.num_clips = Number(data.num_clips);
       data.remove_silence = form.elements.remove_silence.checked;
+      data.jump_cuts = form.elements.jump_cuts.checked;
+      data.layout = form.elements.layout.value;
       data.auto_reframe = form.elements.auto_reframe.checked;
       data.crop_position = Number(form.elements.crop_position.value);
       data.fit_mode = form.elements.fit_mode.value;
@@ -642,6 +650,9 @@
       data.denoise_audio = form.elements.denoise_audio.checked;
       data.remove_filler_words = form.elements.remove_filler_words.checked;
       data.caption_position = form.elements.caption_position.value;
+      data.caption_font = String(data.caption_font || "Arial").trim();
+      data.caption_size = Number(data.caption_size || 0);
+      data.caption_color = data.caption_color || null;
       data.background_music = String(data.background_music || "").trim() || null;
       data.watermark = String(data.watermark || "").trim() || null;
       if (!data.language) delete data.language;

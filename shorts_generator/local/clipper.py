@@ -128,9 +128,18 @@ def _write_ass_captions(
     caption_style: str = "bold",
     remove_filler_words: bool = False,
     caption_position: str = "bottom",
+    caption_font: str = "Arial",
+    caption_size: int = 0,
+    caption_color: Optional[str] = None,
 ) -> int:
     """Write an ASS subtitle file containing transcript segments in a clip."""
     font_size, primary, secondary, back, outline, border_style, alignment = _caption_style_values(caption_style, caption_position)
+    if caption_size:
+        font_size = max(18, min(120, int(caption_size)))
+    if caption_color:
+        raw = caption_color.lstrip("#")
+        if len(raw) == 6:
+            primary = f"&H00{raw[4:6]}{raw[2:4]}{raw[0:2]}"
     header = [
         "[Script Info]",
         "ScriptType: v4.00+",
@@ -141,7 +150,7 @@ def _write_ass_captions(
         "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Default,Arial,{font_size},{primary},{secondary},&H00000000,{back},-1,0,0,0,100,100,0,0,{border_style},{outline},2,{alignment},72,72,170,1",
+        f"Style: Default,{caption_font or 'Arial'},{font_size},{primary},{secondary},&H00000000,{back},-1,0,0,0,100,100,0,0,{border_style},{outline},2,{alignment},72,72,170,1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -256,6 +265,9 @@ def _burn_in_captions(
     caption_style: str = "bold",
     remove_filler_words: bool = False,
     caption_position: str = "bottom",
+    caption_font: str = "Arial",
+    caption_size: int = 0,
+    caption_color: Optional[str] = None,
 ) -> bool:
     """Render transcript captions onto a reframed video with ffmpeg/libass."""
     ass_path = out_path + ".ass"
@@ -268,6 +280,9 @@ def _burn_in_captions(
             caption_style=caption_style,
             remove_filler_words=remove_filler_words,
             caption_position=caption_position,
+            caption_font=caption_font,
+            caption_size=caption_size,
+            caption_color=caption_color,
         )
         if not caption_count:
             shutil.copyfile(video_path, out_path)
@@ -331,8 +346,7 @@ def _reframe_vertical(
     crop_position: float = 0.5,
     fit_mode: str = "crop",
     zoom: float = 1.0,
-    intro: Optional[str] = None,
-    outro: Optional[str] = None,
+    layout: str = "single",
 ) -> str:
     """Crop the cut clip to the target aspect ratio, tracking faces if possible."""
     try:
@@ -344,6 +358,14 @@ def _reframe_vertical(
         ) from e
 
     target_ratio = _ratio(aspect_ratio)
+    if (layout or "single").strip().lower() == "split":
+        ffmpeg = _find_ffmpeg()
+        out_h = 1920
+        out_w = max(2, int(round(out_h * target_ratio)) // 2 * 2)
+        half = max(2, out_w // 2)
+        split_filter = f"[0:v]crop=iw/2:ih:0:0,scale={half}:{out_h}:force_original_aspect_ratio=decrease,pad={half}:{out_h}:(ow-iw)/2:(oh-ih)/2[left];[0:v]crop=iw/2:ih:iw/2:0,scale={half}:{out_h}:force_original_aspect_ratio=decrease,pad={half}:{out_h}:(ow-iw)/2:(oh-ih)/2[right];[left][right]hstack=inputs=2[v]"
+        subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", in_path, "-filter_complex", split_filter, "-map", "[v]", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-shortest", out_path], check=True)
+        return out_path
     if (fit_mode or "crop").strip().lower() == "fit_blur":
         ffmpeg = _find_ffmpeg()
         out_h = 1920
@@ -462,12 +484,19 @@ def crop_clip_local(
     denoise_audio: bool = False,
     remove_filler_words: bool = False,
     caption_position: str = "bottom",
+    caption_font: str = "Arial",
+    caption_size: int = 0,
+    caption_color: Optional[str] = None,
     background_music: Optional[str] = None,
     watermark: Optional[str] = None,
     auto_reframe: bool = True,
     crop_position: float = 0.5,
     fit_mode: str = "crop",
     zoom: float = 1.0,
+    layout: str = "single",
+    intro: Optional[str] = None,
+    outro: Optional[str] = None,
+    jump_cuts: bool = False,
 ) -> str:
     """Cut + reframe one highlight, optionally burning Whisper captions."""
     cut_path = out_path + ".cut.mp4"
@@ -482,6 +511,7 @@ def crop_clip_local(
             crop_position=crop_position,
             fit_mode=fit_mode,
             zoom=zoom,
+            layout=layout,
         )
         if burn_captions and caption_segments:
             _burn_in_captions(
@@ -493,6 +523,9 @@ def crop_clip_local(
                 caption_style=caption_style,
                 remove_filler_words=remove_filler_words,
                 caption_position=caption_position,
+                caption_font=caption_font,
+                caption_size=caption_size,
+                caption_color=caption_color,
             )
         else:
             os.replace(base_path, out_path)
@@ -520,6 +553,10 @@ def crop_clip_local(
             check=True,
         )
         os.replace(processed_path, out_path)
+    if jump_cuts:
+        jump_path = out_path + ".jump.mp4"
+        _remove_silent_video(out_path, jump_path)
+        os.replace(jump_path, out_path)
     if background_music or watermark:
         extra_path = out_path + ".extras.mp4"
         ffmpeg = _find_ffmpeg()
@@ -577,6 +614,43 @@ def crop_clip_local(
     return out_path
 
 
+def _remove_silent_video(in_path: str, out_path: str, threshold: str = "-40dB", min_silence: float = 0.35) -> bool:
+    """Remove silent intervals from both video and audio using FFmpeg concat."""
+    ffmpeg = _find_ffmpeg()
+    detect = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", in_path, "-af", f"silencedetect=noise={threshold}:d={min_silence}", "-f", "null", "-"],
+        capture_output=True, text=True, check=False,
+    )
+    log = (detect.stdout or "") + "\n" + (detect.stderr or "")
+    starts = [float(x) for x in re.findall(r"silence_start:\s*([0-9.]+)", log)]
+    ends = [float(x) for x in re.findall(r"silence_end:\s*([0-9.]+)", log)]
+    probe = subprocess.run([ffmpeg, "-hide_banner", "-i", in_path, "-f", "null", "-"], capture_output=True, text=True, check=False)
+    duration_matches = re.findall(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", probe.stderr or "")
+    if not duration_matches:
+        shutil.copyfile(in_path, out_path)
+        return False
+    h, m, s = duration_matches[0]
+    duration = int(h) * 3600 + int(m) * 60 + float(s)
+    silent = [(max(0.0, start), min(duration, ends[i] if i < len(ends) else duration)) for i, start in enumerate(starts)]
+    keep, cursor = [], 0.0
+    for start, end in silent:
+        if start - cursor > 0.05:
+            keep.append((cursor, start))
+        cursor = max(cursor, end)
+    if duration - cursor > 0.05:
+        keep.append((cursor, duration))
+    if len(keep) <= 1:
+        shutil.copyfile(in_path, out_path)
+        return False
+    filters, concat_inputs = [], []
+    for index, (start, end) in enumerate(keep):
+        filters += [f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS[v{index}]", f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS[a{index}]"]
+        concat_inputs.append(f"[v{index}][a{index}]")
+    filters.append("".join(concat_inputs) + f"concat=n={len(keep)}:v=1:a=1[v][a]")
+    subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", in_path, "-filter_complex", ";".join(filters), "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-c:a", "aac", "-b:a", "128k", out_path], check=True)
+    return True
+
+
 def crop_highlights_local(
     source_path: str,
     highlights: List[Dict],
@@ -589,14 +663,20 @@ def crop_highlights_local(
     normalize_audio: bool = False,
     denoise_audio: bool = False,
     remove_filler_words: bool = False,
+    caption_position: str = "bottom",
+    caption_font: str = "Arial",
+    caption_size: int = 0,
+    caption_color: Optional[str] = None,
     background_music: Optional[str] = None,
     watermark: Optional[str] = None,
     auto_reframe: bool = True,
     crop_position: float = 0.5,
     fit_mode: str = "crop",
     zoom: float = 1.0,
+    layout: str = "single",
     intro: Optional[str] = None,
     outro: Optional[str] = None,
+    jump_cuts: bool = False,
 ) -> List[Dict]:
     out_dir = out_dir or LOCAL_OUTPUT_DIR
     os.makedirs(out_dir, exist_ok=True)
@@ -621,14 +701,17 @@ def crop_highlights_local(
                 normalize_audio=normalize_audio,
                 denoise_audio=denoise_audio,
                 remove_filler_words=remove_filler_words,
+                caption_position=caption_position,
                 background_music=background_music,
                 watermark=watermark,
                 auto_reframe=auto_reframe,
                 crop_position=crop_position,
                 fit_mode=fit_mode,
                 zoom=zoom,
+                layout=layout,
                 intro=intro,
                 outro=outro,
+                jump_cuts=jump_cuts,
             )
             item = {**h, "clip_url": out_path}
             try:
@@ -639,6 +722,7 @@ def crop_highlights_local(
                     source_path,
                     (float(h["start_time"]) + float(h["end_time"])) / 2.0,
                     thumbnail_path,
+                    text=h.get("hook_sentence") or h.get("title") or "",
                 )
                 item["thumbnail_path"] = thumbnail_path
             except Exception as exc:

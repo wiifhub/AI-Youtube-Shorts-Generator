@@ -37,6 +37,9 @@ def _run_local(
     denoise_audio: bool = False,
     remove_filler_words: bool = False,
     caption_position: str = "bottom",
+    caption_font: str = "Arial",
+    caption_size: int = 0,
+    caption_color: Optional[str] = None,
     focus: str = "balanced",
     background_music: Optional[str] = None,
     watermark: Optional[str] = None,
@@ -46,6 +49,8 @@ def _run_local(
     zoom: float = 1.0,
     intro: Optional[str] = None,
     outro: Optional[str] = None,
+    jump_cuts: bool = False,
+    layout: str = "single",
 ) -> Dict:
     from .local.clipper import crop_highlights_local
     from .local.downloader import download_youtube_local
@@ -103,6 +108,9 @@ def _run_local(
         denoise_audio=denoise_audio,
         remove_filler_words=remove_filler_words,
         caption_position=caption_position,
+        caption_font=caption_font,
+        caption_size=caption_size,
+        caption_color=caption_color,
         background_music=background_music,
         watermark=watermark,
         auto_reframe=auto_reframe,
@@ -111,6 +119,8 @@ def _run_local(
         zoom=zoom,
         intro=intro,
         outro=outro,
+        jump_cuts=jump_cuts,
+        layout=layout,
     )
 
     return {
@@ -178,6 +188,9 @@ def generate_shorts(
     denoise_audio: bool = False,
     remove_filler_words: bool = False,
     caption_position: str = "bottom",
+    caption_font: str = "Arial",
+    caption_size: int = 0,
+    caption_color: Optional[str] = None,
     focus: str = "balanced",
     background_music: Optional[str] = None,
     watermark: Optional[str] = None,
@@ -187,6 +200,8 @@ def generate_shorts(
     zoom: float = 1.0,
     intro: Optional[str] = None,
     outro: Optional[str] = None,
+    jump_cuts: bool = False,
+    layout: str = "single",
 ) -> Dict:
     """Run the full pipeline and return a structured result.
 
@@ -238,6 +253,9 @@ def generate_shorts(
             denoise_audio,
             remove_filler_words,
             caption_position,
+            caption_font,
+            caption_size,
+            caption_color,
             focus,
             background_music,
             watermark,
@@ -247,6 +265,8 @@ def generate_shorts(
             zoom,
             intro,
             outro,
+            jump_cuts,
+            layout,
         )
     if mode == "api":
         return _run_api(
