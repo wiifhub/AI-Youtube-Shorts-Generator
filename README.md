@@ -139,11 +139,11 @@ On Windows, from the downloaded/cloned project folder, double-click `install_win
 
 ### Portable Windows executable
 
-Download the current [ShortsStudio-v0.6.0-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.6.0/ShortsStudio-v0.6.0-windows.zip) and extract the entire ZIP. Open the `ShortsStudio` folder and double-click `ShortsStudio.exe`; it starts the local server and opens the browser automatically. Keep the whole folder together because it includes the runtime, CTranslate2, and FFmpeg binaries. Configure API keys in a `.env` file beside the executable when using local LLM ranking. Use **Quit Shorts Studio** in the page to stop the server cleanly.
+Download the current [ShortsStudio-v0.6.1-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.6.1/ShortsStudio-v0.6.1-windows.zip) and extract the entire ZIP. Open the `ShortsStudio` folder and double-click `unblock_and_start.bat`; it removes the download block from the extracted files and starts `ShortsStudio.exe`. You can also launch the executable directly after choosing **More info > Run anyway** once. Keep the whole folder together because it includes the runtime, CTranslate2, and FFmpeg binaries. Configure API keys in a `.env` file beside the executable when using local LLM ranking. Use **Quit Shorts Studio** in the page to stop the server cleanly.
 
 ### Installed Windows application
 
-For a normal Windows installation, download [ShortsStudio-Setup-v0.6.0.exe](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.6.0/ShortsStudio-Setup-v0.6.0.exe). The installer adds a Start Menu entry, offers a Desktop shortcut, installs the bundled runtime and FFmpeg, and registers an uninstaller. The app still runs locally at `http://127.0.0.1:7860`; no cloud account is required for the UI.
+For a normal Windows installation, download [ShortsStudio-Setup-v0.6.1.exe](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.6.1/ShortsStudio-Setup-v0.6.1.exe). The installer adds a Start Menu entry, offers a Desktop shortcut, installs the bundled runtime and FFmpeg, and registers an uninstaller. The app still runs locally at `http://127.0.0.1:7860`; no cloud account is required for the UI.
 
 For a source checkout, install dependencies, then:
 
