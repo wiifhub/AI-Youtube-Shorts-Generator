@@ -5,6 +5,7 @@ expects: {duration, segments[start, end, text]}.
 """
 import os
 import json
+import math
 import re
 from pathlib import Path
 from typing import Dict, Optional
@@ -40,7 +41,13 @@ def _word_cache_path(media_path: str, cache_dir: Optional[str] = None) -> Path:
 
 
 def _format_srt_timestamp(seconds: float) -> str:
-    total_ms = max(0, int(round(seconds * 1000)))
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError, OverflowError):
+        value = 0.0
+    if not math.isfinite(value):
+        value = 0.0
+    total_ms = max(0, int(round(value * 1000)))
     ms = total_ms % 1000
     total_s = total_ms // 1000
     s = total_s % 60
@@ -55,6 +62,8 @@ def _parse_srt_timestamp(value: str) -> float:
     if not match:
         raise ValueError(f"Invalid SRT timestamp: {value!r}")
     hours, minutes, seconds, millis = map(int, match.groups())
+    if minutes >= 60 or seconds >= 60:
+        raise ValueError(f"Invalid SRT timestamp: {value!r}")
     return hours * 3600 + minutes * 60 + seconds + (millis / 1000.0)
 
 
@@ -63,17 +72,34 @@ def _write_srt_cache(
 ) -> Path:
     cache_path = _transcript_cache_path(media_path, cache_dir=cache_dir)
     lines = []
-    for idx, segment in enumerate(transcript.get("segments", []), start=1):
-        start = _format_srt_timestamp(float(segment["start"]))
-        end = _format_srt_timestamp(float(segment["end"]))
+    valid_segments = []
+    raw_segments = transcript.get("segments", []) if isinstance(transcript, dict) else []
+    segment_items = raw_segments if isinstance(raw_segments, (list, tuple)) else []
+    for segment in segment_items:
+        if not isinstance(segment, dict):
+            continue
+        try:
+            start_value = float(segment.get("start"))
+            end_value = float(segment.get("end"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(start_value) or not math.isfinite(end_value) or end_value <= start_value:
+            continue
         text = str(segment.get("text", "")).strip().replace("\r", "").replace("\n", " ")
+        if not text:
+            continue
+        valid_segments.append(segment)
+
+    for idx, segment in enumerate(valid_segments, start=1):
+        start = _format_srt_timestamp(segment.get("start"))
+        end = _format_srt_timestamp(segment.get("end"))
         lines.append(str(idx))
         lines.append(f"{start} --> {end}")
-        lines.append(text)
+        lines.append(str(segment.get("text", "")).strip().replace("\r", "").replace("\n", " "))
         lines.append("")
 
     cache_path.write_text("\n".join(lines), encoding="utf-8")
-    words = [segment.get("words") for segment in transcript.get("segments", [])]
+    words = [segment.get("words") for segment in valid_segments]
     _word_cache_path(media_path, cache_dir=cache_dir).write_text(
         json.dumps(words, ensure_ascii=False), encoding="utf-8"
     )
@@ -96,20 +122,21 @@ def _load_srt_cache(cache_path: Path) -> Dict:
             continue
         start_raw, end_raw = [part.strip() for part in lines[0].split("-->", 1)]
         text = "\n".join(lines[1:]).strip()
-        segments.append(
-            {
-                "start": _parse_srt_timestamp(start_raw),
-                "end": _parse_srt_timestamp(end_raw),
-                "text": text,
-            }
-        )
+        try:
+            start = _parse_srt_timestamp(start_raw)
+            end = _parse_srt_timestamp(end_raw)
+        except ValueError:
+            continue
+        if end <= start or not text:
+            continue
+        segments.append({"start": start, "end": end, "text": text})
 
-    duration = segments[-1]["end"] if segments else 0.0
+    duration = max((segment["end"] for segment in segments), default=0.0)
     return {"duration": duration, "segments": segments}
 
 
 def _resolve_device(requested: Optional[str] = None) -> str:
-    requested = (requested or LOCAL_WHISPER_DEVICE).lower()
+    requested = str(requested or LOCAL_WHISPER_DEVICE).strip().lower()
     if requested not in {"auto", "cpu", "cuda"}:
         raise ValueError("Whisper device must be auto, cpu, or cuda")
     if requested == "cuda":
@@ -131,19 +158,27 @@ def transcribe_local(
     device: Optional[str] = None,
 ) -> Dict:
     """Run faster-whisper on a local file path, caching the result as .srt."""
+    media_path = str(media_path) if media_path is not None else ""
+    if not media_path or not Path(media_path).is_file():
+        raise RuntimeError(f"Local media file does not exist: {media_path}")
     cache_path = _transcript_cache_path(media_path, cache_dir=cache_dir)
     if cache_path.exists():
         source_mtime = os.path.getmtime(media_path)
         cache_mtime = cache_path.stat().st_mtime
         if cache_mtime >= source_mtime:
             print(f"[transcribe/local] reusing cached transcript: {cache_path}", flush=True)
-            cached = _load_srt_cache(cache_path)
+            try:
+                cached = _load_srt_cache(cache_path)
+            except (OSError, ValueError, TypeError):
+                cached = {"duration": 0.0, "segments": []}
             words_path = _word_cache_path(media_path, cache_dir=cache_dir)
             if words_path.exists():
                 try:
-                    for segment, words in zip(cached.get("segments", []), json.loads(words_path.read_text(encoding="utf-8"))):
-                        if words:
-                            segment["words"] = words
+                    cached_words = json.loads(words_path.read_text(encoding="utf-8"))
+                    if isinstance(cached_words, list):
+                        for segment, words in zip(cached.get("segments", []), cached_words):
+                            if isinstance(words, list):
+                                segment["words"] = [word for word in words if isinstance(word, dict)]
                 except (OSError, ValueError, TypeError):
                     pass
             # Treat empty cache as invalid (likely from a failed/partial run) — delete and re-transcribe
@@ -191,26 +226,52 @@ def transcribe_local(
     segments_iter, info = model.transcribe(**transcribe_kwargs)
 
     segments = []
-    for s in segments_iter:
+    try:
+        segment_items = iter(segments_iter or [])
+    except TypeError:
+        segment_items = iter(())
+    for s in segment_items:
+        try:
+            segment_start = float(s.start)
+            segment_end = float(s.end)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(segment_start) or not math.isfinite(segment_end) or segment_end <= segment_start:
+            continue
+        text = (s.text or "").strip()
+        if not text:
+            continue
         segment = {
-            "start": float(s.start),
-            "end": float(s.end),
-            "text": (s.text or "").strip(),
+            "start": segment_start,
+            "end": segment_end,
+            "text": text,
         }
         words = []
         for word in getattr(s, "words", None) or []:
             if getattr(word, "start", None) is None or getattr(word, "end", None) is None:
                 continue
+            try:
+                word_start = float(word.start)
+                word_end = float(word.end)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(word_start) or not math.isfinite(word_end) or word_end <= word_start:
+                continue
             words.append({
-                "start": float(word.start),
-                "end": float(word.end),
+                "start": word_start,
+                "end": word_end,
                 "word": str(getattr(word, "word", "") or "").strip(),
             })
         if words:
             segment["words"] = words
         segments.append(segment)
 
-    duration = float(getattr(info, "duration", 0.0)) or (segments[-1]["end"] if segments else 0.0)
+    try:
+        duration = float(getattr(info, "duration", 0.0))
+    except (TypeError, ValueError, OverflowError):
+        duration = 0.0
+    if not math.isfinite(duration) or duration <= 0:
+        duration = segments[-1]["end"] if segments else 0.0
     print(f"[transcribe/local] {len(segments)} segments, {duration:.0f}s of audio", flush=True)
     transcript = {"duration": duration, "segments": segments}
     cache_path = _write_srt_cache(media_path, transcript, cache_dir=cache_dir)

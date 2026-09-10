@@ -27,7 +27,9 @@ def _format_for(fmt: str) -> str:
     """Map our '720' / '1080' shorthand to a yt-dlp format selector."""
     try:
         height = int(fmt)
-    except ValueError:
+    except (TypeError, ValueError, OverflowError):
+        height = 720
+    if height <= 0:
         height = 720
     return (
         f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
@@ -37,8 +39,13 @@ def _format_for(fmt: str) -> str:
 
 def _extract_youtube_video_id(source: str) -> Optional[str]:
     """Best-effort extraction of a YouTube video id from a URL."""
+    if not source:
+        return None
+    source = str(source).strip()
+    if not source:
+        return None
     parsed = urlparse(source)
-    host = (parsed.netloc or "").lower()
+    host = (parsed.netloc or "").lower().split("@")[-1].split(":", 1)[0].rstrip(".")
     if host.startswith("www."):
         host = host[4:]
 
@@ -46,7 +53,7 @@ def _extract_youtube_video_id(source: str) -> Optional[str]:
         video_id = parsed.path.lstrip("/").split("/", 1)[0]
         return video_id or None
 
-    if "youtube.com" in host:
+    if host == "youtube.com" or host.endswith(".youtube.com"):
         if parsed.path.startswith("/watch"):
             qs = parse_qs(parsed.query)
             video_id = qs.get("v", [""])[0]
@@ -60,6 +67,11 @@ def _extract_youtube_video_id(source: str) -> Optional[str]:
 
 def _resolve_local_path(source: str) -> Optional[str]:
     """Return a local filesystem path if the input already points at one."""
+    if source is None:
+        raise RuntimeError("A YouTube URL or local video path is required.")
+    source = str(source).strip()
+    if not source:
+        raise RuntimeError("A YouTube URL or local video path is required.")
     parsed = urlparse(source)
     if parsed.scheme == "file":
         raw_path = unquote(parsed.path)
@@ -92,13 +104,16 @@ def _existing_download(out_dir: str, video_id: str) -> Optional[str]:
     """Return a cached download path if we already have this YouTube id."""
     for ext in (".mp4", ".mkv", ".webm"):
         candidate = os.path.join(out_dir, f"source_{video_id}{ext}")
-        if os.path.exists(candidate):
+        if os.path.isfile(candidate):
             return candidate
     return None
 
 
 def download_youtube_local(video_url: str, fmt: str = "720", out_dir: Optional[str] = None) -> str:
     """Download a remote URL or return a local file path unchanged."""
+    if video_url is None:
+        raise RuntimeError("A YouTube URL or local video path is required.")
+    video_url = str(video_url).strip()
     local_path = _resolve_local_path(video_url)
     if local_path:
         print(f"[download/local] using local file: {local_path}", flush=True)

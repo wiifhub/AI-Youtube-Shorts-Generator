@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 MUAPI_API_KEY = os.getenv("MUAPI_API_KEY", "").strip()
-MUAPI_BASE_URL = os.getenv("MUAPI_BASE_URL", "https://api.muapi.ai/api/v1").rstrip("/")
+MUAPI_BASE_URL = (os.getenv("MUAPI_BASE_URL", "https://api.muapi.ai/api/v1").strip() or "https://api.muapi.ai/api/v1").rstrip("/")
 
 
 
@@ -25,13 +25,13 @@ POLL_TIMEOUT_SECONDS = _positive_float_env("MUAPI_POLL_TIMEOUT", 600.0)
 
 # Local-mode (--mode local) settings — only consulted when running offline.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
-LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "base")
-LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE", "auto")  # auto / cpu / cuda
-LOCAL_OUTPUT_DIR = os.getenv("LOCAL_OUTPUT_DIR", "output")
+LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "base").strip() or "base"
+LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE", "auto").strip().lower() or "auto"  # auto / cpu / cuda
+LOCAL_OUTPUT_DIR = os.getenv("LOCAL_OUTPUT_DIR", "output").strip() or "output"
 LOCAL_BURN_CAPTIONS = os.getenv("LOCAL_BURN_CAPTIONS", "true").strip().lower() == "true"
 
 

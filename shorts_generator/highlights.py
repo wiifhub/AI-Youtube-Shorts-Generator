@@ -11,6 +11,7 @@ drive either MuAPI (default, --mode api) or a direct local LLM client
 (--mode local).
 """
 import json
+import math
 import re
 from typing import Callable, Dict, List, Optional
 
@@ -113,16 +114,22 @@ def _parse_json_loose(raw: str) -> Dict:
 
 def _coerce_float(value: object, default: float = 0.0) -> float:
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError):
         return default
+    return converted if math.isfinite(converted) else default
 
 
 def _coerce_int(value: object, default: int = 0) -> int:
     try:
         return int(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _items(value: object) -> List:
+    """Return list-like model data, treating malformed containers as empty."""
+    return list(value) if isinstance(value, (list, tuple)) else []
 
 
 def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
@@ -162,33 +169,79 @@ def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
 
 
 def detect_content_type(transcript: Dict, llm_fn: LLMFn = call_muapi_llm) -> Dict[str, str]:
-    segments = transcript.get("segments", [])
-    sample = " ".join(s["text"] for s in segments[:25])[:3000]
+    segments = _items(transcript.get("segments", []) if isinstance(transcript, dict) else [])
+    sample = " ".join(
+        str(segment.get("text") or "").strip()
+        for segment in segments[:25]
+        if isinstance(segment, dict)
+    )[:3000]
     prompt = f"{CONTENT_TYPE_PROMPT}\n\nTranscript sample:\n{sample}"
     try:
         raw = llm_fn(prompt)
-        return _parse_json_loose(raw)
+        parsed = _parse_json_loose(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("content classifier returned a non-object JSON value")
+        content_type = str(parsed.get("content_type") or "other").strip().lower()
+        density = str(parsed.get("density") or "medium").strip().lower()
+        return {
+            "content_type": content_type[:40] or "other",
+            "density": density[:20] or "medium",
+        }
     except Exception:
         return {"content_type": "other", "density": "medium"}
 
 
 def build_transcript_text(transcript: Dict) -> str:
-    segments = transcript.get("segments", [])
-    text = "\n".join(f"[{s['start']:.1f}s] {s['text'].strip()}" for s in segments)
-    visual_events = transcript.get("visual_events") or []
+    segments = _items(transcript.get("segments", []) if isinstance(transcript, dict) else [])
+    lines = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        start = _coerce_float(segment.get("start"), default=-1.0)
+        if start < 0:
+            continue
+        text_value = str(segment.get("text") or "").strip()
+        if text_value:
+            lines.append(f"[{start:.1f}s] {text_value}")
+    text = "\n".join(lines)
+    visual_events = _items(
+        transcript.get("visual_events") if isinstance(transcript, dict) else []
+    )
     if visual_events:
         text += "\n\nVisual signals (use as supporting evidence, not as guaranteed context):\n"
-        text += "\n".join(
-            f"[{float(event.get('time', 0.0)):.1f}s] {event.get('type', 'visual_event')}"
-            for event in visual_events[:400]
-            if isinstance(event, dict)
-        )
+        visual_lines = []
+        for event in visual_events[:400]:
+            if not isinstance(event, dict):
+                continue
+            timestamp = _coerce_float(event.get("time"), default=0.0)
+            event_type = str(event.get("type") or "visual_event").strip() or "visual_event"
+            visual_lines.append(f"[{timestamp:.1f}s] {event_type}")
+        text += "\n".join(visual_lines)
     return text
 
 
 def chunk_transcript(transcript: Dict) -> List[Dict]:
-    segments = transcript.get("segments", [])
-    duration = transcript.get("duration", segments[-1]["end"] if segments else 0)
+    raw_segments = _items(transcript.get("segments", []) if isinstance(transcript, dict) else [])
+    segments = []
+    for raw in raw_segments:
+        if not isinstance(raw, dict):
+            continue
+        start = _coerce_float(raw.get("start"), default=-1.0)
+        end = _coerce_float(raw.get("end"), default=-1.0)
+        if start < 0 or end <= start:
+            continue
+        segment = dict(raw)
+        segment["start"] = start
+        segment["end"] = end
+        segments.append(segment)
+    duration = _coerce_float(
+        transcript.get("duration") if isinstance(transcript, dict) else None,
+        default=0.0,
+    )
+    if duration <= 0:
+        duration = max((s["end"] for s in segments), default=0.0)
+    if duration <= 0:
+        return []
     chunks = []
     start = 0
     while start < duration:
@@ -198,7 +251,7 @@ def chunk_transcript(transcript: Dict) -> List[Dict]:
             if s["start"] >= start and s["end"] <= end + CHUNK_OVERLAP_SECONDS
         ]
         if chunk_segs:
-            chunk = dict(transcript)
+            chunk = dict(transcript) if isinstance(transcript, dict) else {}
             chunk["segments"] = chunk_segs
             chunk["duration"] = end - start
             chunk["_offset"] = start
@@ -216,6 +269,9 @@ def call_highlight_api(
     llm_fn: LLMFn = call_muapi_llm,
     focus: str = "balanced",
 ) -> Dict:
+    duration = max(0.0, _coerce_float(duration, default=0.0))
+    num_clips = max(1, min(12, _coerce_int(num_clips, default=3)))
+    content_info = content_info if isinstance(content_info, dict) else {}
     # Ask for ~2× the user's target so dedupe has headroom, but cap so the model
     # doesn't have to generate a huge JSON payload (which times out gpt-5-mini).
     target = max(num_clips * 2, 5)
@@ -229,7 +285,7 @@ def call_highlight_api(
         "controversial": "favor strong opinions, disagreement, debate, and counter-intuitive claims",
         "visual": "favor energetic moments, expressive reactions, reveals, and visually motivated beats",
     }
-    normalized_focus = (focus or "balanced").strip().lower()
+    normalized_focus = str(focus or "balanced").strip().lower()
     system = HIGHLIGHT_SYSTEM_PROMPT.format(
         virality_criteria=VIRALITY_CRITERIA,
         content_type=content_info.get("content_type", "other"),
@@ -271,16 +327,24 @@ def call_highlight_api(
 
 def dedupe_highlights(highlights: List[Dict]) -> List[Dict]:
     """Drop a highlight if it overlaps >50% with a higher-scoring one already kept."""
-    highlights = sorted(highlights, key=lambda x: int(x.get("score", 0)), reverse=True)
+    highlights = sorted(
+        (item for item in (highlights or []) if isinstance(item, dict)),
+        key=lambda x: _coerce_int(x.get("score"), default=0),
+        reverse=True,
+    )
     kept: List[Dict] = []
     for h in highlights:
-        h_start = float(h["start_time"])
-        h_end = float(h["end_time"])
+        if not isinstance(h, dict):
+            continue
+        h_start = _coerce_float(h.get("start_time"), default=-1.0)
+        h_end = _coerce_float(h.get("end_time"), default=-1.0)
         h_dur = h_end - h_start
+        if h_start < 0 or h_end <= h_start:
+            continue
         overlapping = False
         for k in kept:
-            latest_start = max(h_start, float(k["start_time"]))
-            earliest_end = min(h_end, float(k["end_time"]))
+            latest_start = max(h_start, _coerce_float(k.get("start_time"), default=-1.0))
+            earliest_end = min(h_end, _coerce_float(k.get("end_time"), default=-1.0))
             overlap = earliest_end - latest_start
             if overlap > 0 and overlap > 0.5 * h_dur:
                 overlapping = True
@@ -302,23 +366,20 @@ def snap_highlight_boundaries(
     would invert after snapping, retain its original timestamps instead of
     dropping an otherwise useful highlight.
     """
-    segments = transcript.get("segments") or []
+    segments = _items(transcript.get("segments") if isinstance(transcript, dict) else [])
     starts: List[float] = []
     ends: List[float] = []
     for segment in segments:
         if not isinstance(segment, dict):
             continue
-        try:
-            start = float(segment.get("start", 0.0))
-            end = float(segment.get("end", 0.0))
-        except (TypeError, ValueError):
-            continue
+        start = _coerce_float(segment.get("start"), default=-1.0)
+        end = _coerce_float(segment.get("end"), default=-1.0)
         if start < end:
             starts.append(start)
             ends.append(end)
 
     if not starts or not ends:
-        return [dict(h) for h in highlights]
+        return [dict(h) for h in (highlights or []) if isinstance(h, dict)]
 
     starts.sort()
     ends.sort()
@@ -328,10 +389,11 @@ def snap_highlight_boundaries(
 
     snapped: List[Dict] = []
     for highlight in highlights:
-        try:
-            original_start = float(highlight["start_time"])
-            original_end = float(highlight["end_time"])
-        except (KeyError, TypeError, ValueError):
+        if not isinstance(highlight, dict):
+            continue
+        original_start = _coerce_float(highlight.get("start_time"), default=-1.0)
+        original_end = _coerce_float(highlight.get("end_time"), default=-1.0)
+        if original_start < 0 or original_end <= original_start:
             snapped.append(dict(highlight))
             continue
 
@@ -367,13 +429,25 @@ def get_highlights(
     mode passes in a local LLM-backed callable.
     """
     llm_fn = llm_fn or call_muapi_llm
-    duration = transcript.get("duration", 0)
+    duration = _coerce_float(
+        transcript.get("duration") if isinstance(transcript, dict) else None,
+        default=0.0,
+    )
+    if duration <= 0 and isinstance(transcript, dict):
+        duration = max(
+            (
+                _coerce_float(segment.get("end"), default=0.0)
+                for segment in _items(transcript.get("segments", []))
+                if isinstance(segment, dict)
+            ),
+            default=0.0,
+        )
     content_info = detect_content_type(transcript, llm_fn=llm_fn)
     print(f"[highlights] content={content_info.get('content_type')} density={content_info.get('density')} duration={duration:.0f}s", flush=True)
 
     if duration >= LONG_VIDEO_THRESHOLD:
         chunks = chunk_transcript(transcript)
-        print(f"[highlights] long video — splitting into {len(chunks)} chunks", flush=True)
+        print(f"[highlights] long video - splitting into {len(chunks)} chunks", flush=True)
         all_highlights: List[Dict] = []
         for i, chunk in enumerate(chunks):
             offset = float(chunk.get("_offset", 0))

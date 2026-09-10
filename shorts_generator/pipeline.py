@@ -60,21 +60,21 @@ def _run_local(
     from .local.transcriber import transcribe_local
     from .local.visual import analyze_video
 
-    _emit(progress, "download", "Fetching source video…")
+    _emit(progress, "download", "Fetching source video...")
     source_path = download_youtube_local(
         youtube_url,
         fmt=download_format,
         out_dir=output_dir,
     )
 
-    _emit(progress, "analyze", "Scanning scenes, faces, and visual changes…")
+    _emit(progress, "analyze", "Scanning scenes, faces, and visual changes...")
     try:
         visual_events = analyze_video(source_path)
     except Exception as exc:
         print(f"[visual/local] analysis skipped: {exc}", flush=True)
         visual_events = []
 
-    _emit(progress, "transcribe", "Transcribing with Whisper…")
+    _emit(progress, "transcribe", "Transcribing with Whisper...")
     transcript = transcribe_local(
         source_path,
         language=language,
@@ -88,7 +88,7 @@ def _run_local(
             "Whisper produced no segments. The video may have no detectable speech."
         )
 
-    _emit(progress, "rank", "Ranking viral highlights…")
+    _emit(progress, "rank", "Ranking viral highlights...")
     highlights_result = get_highlights(
         transcript, num_clips=num_clips, llm_fn=call_local_llm, focus=focus
     )
@@ -97,7 +97,7 @@ def _run_local(
         raise RuntimeError("Highlight generator returned zero clips.")
 
     top = sorted(all_highlights, key=lambda h: int(h.get("score", 0)), reverse=True)[:num_clips]
-    _emit(progress, "crop", f"Cropping {len(top)} of {len(all_highlights)} candidates…")
+    _emit(progress, "crop", f"Cropping {len(top)} of {len(all_highlights)} candidates...")
 
     shorts = crop_highlights_local(
         source_path,
@@ -145,17 +145,17 @@ def _run_api(
     progress: ProgressFn = None,
     focus: str = "balanced",
 ) -> Dict:
-    _emit(progress, "download", "Fetching source video via MuAPI…")
+    _emit(progress, "download", "Fetching source video via MuAPI...")
     source_url = download_youtube(youtube_url, fmt=download_format)
 
-    _emit(progress, "transcribe", "Transcribing with Whisper…")
+    _emit(progress, "transcribe", "Transcribing with Whisper...")
     transcript = transcribe(source_url, language=language)
     if not transcript["segments"]:
         raise RuntimeError(
             "Whisper produced no segments. The video may have no detectable speech."
         )
 
-    _emit(progress, "rank", "Ranking viral highlights…")
+    _emit(progress, "rank", "Ranking viral highlights...")
     highlights_result = get_highlights(
         transcript, num_clips=num_clips, llm_fn=call_muapi_llm, focus=focus
     )
@@ -164,7 +164,7 @@ def _run_api(
         raise RuntimeError("Highlight generator returned zero clips.")
 
     top = sorted(all_highlights, key=lambda h: int(h.get("score", 0)), reverse=True)[:num_clips]
-    _emit(progress, "crop", f"Cropping {len(top)} of {len(all_highlights)} candidates…")
+    _emit(progress, "crop", f"Cropping {len(top)} of {len(all_highlights)} candidates...")
 
     shorts = crop_highlights(source_url, top, aspect_ratio=aspect_ratio)
 
@@ -243,7 +243,12 @@ def generate_shorts(
           "shorts": [...],           # top `num_clips` with clip_url / local path
         }
     """
-    mode = (mode or "api").lower()
+    try:
+        num_clips = int(num_clips)
+    except (TypeError, ValueError, OverflowError):
+        num_clips = 3
+    num_clips = max(1, min(12, num_clips))
+    mode = str(mode or "api").strip().lower()
     if mode == "local":
         return _run_local(
             youtube_url,

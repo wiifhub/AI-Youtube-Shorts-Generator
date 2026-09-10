@@ -7,6 +7,7 @@ Usage:
 import argparse
 import json
 import sys
+from pathlib import Path
 
 # Windows uses 'charmap' by default, which can't encode Unicode characters
 # like →. Reconfigure stdout/stderr to UTF-8 so output works on all platforms.
@@ -50,10 +51,10 @@ def main() -> int:
     print("\n" + "=" * 72)
     print(f"Mode:          {result.get('mode', args.mode)}")
     print(f"Source video:  {result['source_video_url']}")
-    print(f"Highlights:    {len(result['highlights'])} candidates → kept top {len(result['shorts'])}")
+    print(f"Highlights:    {len(result['highlights'])} candidates -> kept top {len(result['shorts'])}")
     print("=" * 72)
     for i, s in enumerate(result["shorts"], 1):
-        print(f"\n#{i}  score={s.get('score')}  {s.get('start_time'):.1f}s → {s.get('end_time'):.1f}s")
+        print(f"\n#{i}  score={s.get('score')}  {s.get('start_time'):.1f}s -> {s.get('end_time'):.1f}s")
         print(f"     title:  {s.get('title')}")
         print(f"     hook:   {s.get('hook_sentence')}")
         if s.get("clip_url"):
@@ -62,9 +63,11 @@ def main() -> int:
             print(f"     clip:   FAILED ({s.get('error')})")
 
     if args.output_json:
-        with open(args.output_json, "w") as f:
+        output_path = Path(args.output_json).expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
-        print(f"\nFull JSON written to {args.output_json}")
+        print(f"\nFull JSON written to {output_path}")
 
     return 0
 

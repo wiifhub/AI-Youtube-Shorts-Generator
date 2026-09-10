@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import io
+import math
 import os
 import re
 import shutil
@@ -50,6 +51,7 @@ app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 _jobs: Dict[str, Dict[str, Any]] = {}
 _lock = threading.Lock()
 _cancel_events: Dict[str, threading.Event] = {}
+_job_id_pattern = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -80,8 +82,43 @@ _max_upload_mb = _positive_int_env("SHORTS_MAX_UPLOAD_MB", 2048)
 _max_upload_bytes = _max_upload_mb * 1024 * 1024
 
 
+def _safe_transcript_duration(transcript: Any) -> float:
+    """Read a usable duration from persisted/API transcript data."""
+    if not isinstance(transcript, dict):
+        return 0.0
+    try:
+        duration = float(transcript.get("duration") or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        duration = 0.0
+    if math.isfinite(duration) and duration > 0:
+        return duration
+    ends = []
+    raw_segments = transcript.get("segments")
+    segments = raw_segments if isinstance(raw_segments, (list, tuple)) else []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        try:
+            end = float(segment.get("end"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(end) and end > 0:
+            ends.append(end)
+    return max(ends, default=0.0)
+
+
+def _dict_items(value: Any) -> List[Dict[str, Any]]:
+    """Return only object entries from persisted/API list data."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
 def _job_path(job_id: str) -> Path:
-    return _jobs_dir / f"{job_id}.json"
+    safe_id = str(job_id)
+    if not _job_id_pattern.fullmatch(safe_id):
+        raise ValueError("invalid job id")
+    return _jobs_dir / f"{safe_id}.json"
 
 
 def _persist_job_locked(job: Dict[str, Any]) -> None:
@@ -99,7 +136,13 @@ def _persist_job_locked(job: Dict[str, Any]) -> None:
 def _load_persisted_jobs() -> None:
     """Restore recent jobs and mark in-flight work interrupted by a restart."""
     _jobs_dir.mkdir(parents=True, exist_ok=True)
-    for path in sorted(_jobs_dir.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+    files = []
+    for path in _jobs_dir.glob("*.json"):
+        try:
+            files.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    for _, path in sorted(files, key=lambda item: item[0], reverse=True):
         try:
             job = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
@@ -107,7 +150,21 @@ def _load_persisted_jobs() -> None:
         if not isinstance(job, dict) or not job.get("id"):
             continue
         job_id = str(job["id"])
-        job.setdefault("logs", [])
+        if not _job_id_pattern.fullmatch(job_id):
+            continue
+        job["id"] = job_id
+        if not isinstance(job.get("logs"), list):
+            job["logs"] = []
+        try:
+            created_at = float(job.get("created_at") or path.stat().st_mtime)
+            if not math.isfinite(created_at):
+                raise ValueError("created_at must be finite")
+            job["created_at"] = created_at
+        except (OSError, TypeError, ValueError, OverflowError):
+            job["created_at"] = time.time()
+        job.setdefault("status", "error")
+        job.setdefault("stage", "unknown")
+        job.setdefault("message", "Recovered project")
         if job.get("status") == "running":
             message = "Interrupted when Shorts Studio stopped; start a new job to retry."
             job["status"] = "error"
@@ -123,6 +180,7 @@ _load_persisted_jobs()
 
 
 class JobRequest(BaseModel):
+    model_config = {"allow_inf_nan": False}
     url: str = Field(..., min_length=3)
     mode: str = "local"
     num_clips: int = Field(3, ge=1, le=12)
@@ -160,6 +218,7 @@ class BatchRequest(JobRequest):
 
 
 class ClipUpdate(BaseModel):
+    model_config = {"allow_inf_nan": False}
     start_time: float = Field(..., ge=0)
     end_time: float = Field(..., gt=0)
     caption_style: Optional[str] = None
@@ -179,15 +238,15 @@ class ProjectUpdate(BaseModel):
 
 def _job_snapshot(job: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "id": job["id"],
-        "status": job["status"],
-        "stage": job["stage"],
-        "message": job["message"],
-        "logs": job["logs"][-80:],
+        "id": str(job.get("id") or ""),
+        "status": str(job.get("status") or "unknown"),
+        "stage": str(job.get("stage") or "unknown"),
+        "message": str(job.get("message") or ""),
+        "logs": (job.get("logs") if isinstance(job.get("logs"), list) else [])[-80:],
         "error": job.get("error"),
         "result": job.get("result"),
-        "created_at": job["created_at"],
-        "request": job.get("request"),
+        "created_at": job.get("created_at"),
+        "request": job.get("request") if isinstance(job.get("request"), dict) else {},
         "output_dir": job.get("output_dir"),
     }
 
@@ -219,7 +278,7 @@ def _creator_metadata(short: Dict[str, Any]) -> Dict[str, str]:
 
 def _public_shorts(shorts: List[Dict], job_id: str) -> List[Dict]:
     out = []
-    for i, s in enumerate(shorts):
+    for i, s in enumerate(_dict_items(shorts)):
         item = dict(s)
         clip = item.get("clip_url") or ""
         if clip and not str(clip).startswith("http"):
@@ -248,7 +307,7 @@ def _run_job(job_id: str, req: JobRequest) -> None:
 
     try:
         _job_slots.acquire()
-        progress("queued", "Starting pipeline…")
+        progress("queued", "Starting pipeline...")
         if req.save_folder:
             base = Path(req.save_folder).expanduser().resolve()
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -357,6 +416,8 @@ def index() -> FileResponse:
 def _enqueue_job(req: JobRequest) -> Dict[str, Any]:
     if req.mode not in ("api", "local"):
         raise HTTPException(400, "mode must be api or local")
+    if not req.url or not req.url.strip():
+        raise HTTPException(400, "url/path cannot be blank")
     job_id = uuid.uuid4().hex[:12]
     with _lock:
         _jobs[job_id] = {
@@ -479,18 +540,35 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
 
 @app.get("/api/jobs")
 def list_jobs() -> Dict[str, Any]:
+    def created_at_value(job: Dict[str, Any]) -> float:
+        try:
+            value = float(job.get("created_at") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return value if math.isfinite(value) else 0.0
+
     with _lock:
-        jobs = [_job_snapshot(j) for j in sorted(_jobs.values(), key=lambda x: x["created_at"], reverse=True)]
+        jobs = [
+            _job_snapshot(j)
+            for j in sorted(
+                _jobs.values(),
+                key=created_at_value,
+                reverse=True,
+            )
+        ]
     return {"jobs": jobs[:20]}
 
 
 @app.patch("/api/jobs/{job_id}")
 def rename_job(job_id: str, update: ProjectUpdate) -> Dict[str, Any]:
+    name = " ".join(update.name.split())
+    if not name:
+        raise HTTPException(400, "project name cannot be blank")
     with _lock:
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, "job not found")
-        job["name"] = " ".join(update.name.split())
+        job["name"] = name
         _persist_job_locked(job)
         return _job_snapshot(job)
 
@@ -502,15 +580,18 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, "job not found")
-        raw_shorts = list(job.get("raw_shorts") or [])
+        raw_shorts = _dict_items(job.get("raw_shorts"))
         if index < 0 or index >= len(raw_shorts):
             raise HTTPException(404, "clip not found")
         request = dict(job.get("request") or {})
-        transcript = dict(job.get("raw_transcript") or {})
+        transcript = job.get("raw_transcript")
+        transcript = dict(transcript) if isinstance(transcript, dict) else {}
         source = job.get("raw_source_video_url")
         mode = str((job.get("result") or {}).get("mode") or request.get("mode") or "local")
 
-    duration = float(transcript.get("duration") or 0.0)
+    duration = _safe_transcript_duration(transcript)
+    if duration and update.start_time >= duration:
+        raise HTTPException(400, f"start_time must be before the {duration:.1f}s source")
     if duration and update.end_time > duration + 0.25:
         raise HTTPException(400, f"end_time must be within the {duration:.1f}s source")
     if update.end_time <= update.start_time + 0.1:
@@ -539,7 +620,7 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
                 update.end_time,
                 str(request.get("aspect_ratio") or "9:16"),
                 render_path,
-                caption_segments=list(transcript.get("segments") or []),
+                caption_segments=_dict_items(transcript.get("segments")),
                 burn_captions=LOCAL_BURN_CAPTIONS,
                 caption_style=style,
                 remove_silence=bool(request.get("remove_silence")),
@@ -637,7 +718,7 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
 
     with _lock:
         job = _jobs[job_id]
-        current = list(job.get("raw_shorts") or [])
+        current = _dict_items(job.get("raw_shorts"))
         if index >= len(current):
             raise HTTPException(409, "job clips changed while regenerating")
         current[index] = replacement
@@ -657,7 +738,7 @@ def undo_clip(job_id: str, index: int) -> Dict[str, Any]:
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, "job not found")
-        shorts = list(job.get("raw_shorts") or [])
+        shorts = _dict_items(job.get("raw_shorts"))
         if index < 0 or index >= len(shorts):
             raise HTTPException(404, "clip not found")
         item = dict(shorts[index])
@@ -684,11 +765,13 @@ def get_timeline(job_id: str) -> Dict[str, Any]:
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, "job not found")
-        transcript = job.get("raw_transcript") or {}
+        transcript = job.get("raw_transcript")
+        if not isinstance(transcript, dict):
+            transcript = {}
         return {
-            "duration": transcript.get("duration", 0),
-            "segments": transcript.get("segments", []),
-            "visual_events": transcript.get("visual_events", []),
+            "duration": _safe_transcript_duration(transcript),
+            "segments": _dict_items(transcript.get("segments")),
+            "visual_events": _dict_items(transcript.get("visual_events")),
         }
 
 
@@ -700,7 +783,7 @@ def export_job(job_id: str):
         if not job:
             raise HTTPException(404, "job not found")
         result = dict(job.get("result") or {})
-        raw_shorts = list(job.get("raw_shorts") or [])
+        raw_shorts = _dict_items(job.get("raw_shorts"))
         request = dict(job.get("request") or {})
 
     manifest = {
@@ -752,7 +835,7 @@ def get_clip(job_id: str, index: int):
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, "job not found")
-        shorts = job.get("raw_shorts") or []
+        shorts = _dict_items(job.get("raw_shorts"))
     if index < 0 or index >= len(shorts):
         raise HTTPException(404, "clip not found")
     path = shorts[index].get("clip_url")
@@ -773,11 +856,14 @@ def preview_clip(job_id: str, update: ClipUpdate) -> Dict[str, Any]:
             raise HTTPException(404, "job not found")
         request = dict(job.get("request") or {})
         source = job.get("raw_source_video_url")
-        transcript = dict(job.get("raw_transcript") or {})
+        transcript = job.get("raw_transcript")
+        transcript = dict(transcript) if isinstance(transcript, dict) else {}
         output_dir = str(job.get("output_dir") or (_jobs_dir / job_id))
     if not source or not Path(str(source)).is_file():
         raise HTTPException(400, "a completed local job is required for preview")
-    duration = float(transcript.get("duration") or 0.0)
+    duration = _safe_transcript_duration(transcript)
+    if duration and update.start_time >= duration:
+        raise HTTPException(400, f"start_time must be before the {duration:.1f}s source")
     if duration and update.end_time > duration + 0.25:
         raise HTTPException(400, f"end_time must be within the {duration:.1f}s source")
     if update.end_time <= update.start_time + 0.1:
@@ -793,7 +879,7 @@ def preview_clip(job_id: str, update: ClipUpdate) -> Dict[str, Any]:
         crop_clip_local(
             str(source), update.start_time, update.end_time,
             str(request.get("aspect_ratio") or "9:16"), str(render_path),
-            caption_segments=list(transcript.get("segments") or []),
+            caption_segments=_dict_items(transcript.get("segments")),
             burn_captions=LOCAL_BURN_CAPTIONS,
             caption_style=style,
             caption_position=update.caption_position,
@@ -843,7 +929,7 @@ def get_thumbnail(job_id: str, index: int):
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, "job not found")
-        shorts = job.get("raw_shorts") or []
+        shorts = _dict_items(job.get("raw_shorts"))
     if index < 0 or index >= len(shorts):
         raise HTTPException(404, "thumbnail not found")
     path = shorts[index].get("thumbnail_path")
@@ -886,6 +972,10 @@ async def upload_video(file: UploadFile = File(...)) -> Dict[str, Any]:
             temporary.unlink(missing_ok=True)
         raise
     except OSError as exc:
+        if temporary.exists():
+            temporary.unlink(missing_ok=True)
+        raise HTTPException(500, f"could not save upload: {exc}") from exc
+    except Exception as exc:
         if temporary.exists():
             temporary.unlink(missing_ok=True)
         raise HTTPException(500, f"could not save upload: {exc}") from exc

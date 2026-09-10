@@ -83,9 +83,17 @@ def _ratio(aspect_ratio: str) -> float:
         return 9.0 / 16.0
 
 
+def _finite_float(value: object, default: float) -> float:
+    try:
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return converted if math.isfinite(converted) else default
+
+
 def _ass_timestamp(seconds: float) -> str:
     """Format seconds as an ASS timestamp (H:MM:SS.cc)."""
-    total_cs = max(0, int(round(float(seconds) * 100)))
+    total_cs = max(0, int(round(_finite_float(seconds, 0.0) * 100)))
     centiseconds = total_cs % 100
     total_seconds = total_cs // 100
     second = total_seconds % 60
@@ -182,8 +190,10 @@ def _caption_style_values(style: str, position: str = "bottom") -> Tuple[int, st
         "boxed": (52, "&H00FFFFFF", "&H00000000", "&HCC000000", 1, 3, 2),
         "karaoke": (54, "&H0000FFFF", "&H0000FFFF", "&H99000000", 7, 1, 2),
     }
-    values = presets.get((style or "bold").strip().lower(), presets["bold"])
-    alignment = {"top": 8, "center": 5, "bottom": 2}.get((position or "bottom").lower(), 2)
+    style_key = str(style or "bold").strip().lower()
+    position_key = str(position or "bottom").strip().lower()
+    values = presets.get(style_key, presets["bold"])
+    alignment = {"top": 8, "center": 5, "bottom": 2}.get(position_key, 2)
     return (*values[:6], alignment)
 
 
@@ -200,10 +210,15 @@ def _write_ass_captions(
     caption_color: Optional[str] = None,
 ) -> int:
     """Write an ASS subtitle file containing transcript segments in a clip."""
+    clip_start = _finite_float(clip_start, 0.0)
+    clip_end = _finite_float(clip_end, clip_start)
+    if clip_end <= clip_start:
+        return 0
+    style_key = str(caption_style or "bold").strip().lower()
     font_size, primary, secondary, back, outline, border_style, alignment = _caption_style_values(caption_style, caption_position)
     try:
         requested_size = int(caption_size) if caption_size else 0
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         requested_size = 0
     if requested_size:
         font_size = max(18, min(120, requested_size))
@@ -229,7 +244,8 @@ def _write_ass_captions(
     ]
     lines = list(header)
     count = 0
-    for segment in segments or []:
+    segment_items = segments if isinstance(segments, (list, tuple)) else []
+    for segment in segment_items:
         if not isinstance(segment, dict):
             continue
         try:
@@ -248,7 +264,7 @@ def _write_ass_captions(
         relative_end = min(clip_end, end) - clip_start
         if relative_end <= relative_start:
             continue
-        if (caption_style or "").strip().lower() == "karaoke":
+        if style_key == "karaoke":
             timed_words = []
             for word in segment.get("words") or []:
                 try:
@@ -300,6 +316,7 @@ def _write_ass_captions(
             )
             count += 1
 
+    Path(ass_path).parent.mkdir(parents=True, exist_ok=True)
     Path(ass_path).write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
     return count
 
@@ -308,7 +325,12 @@ def _has_caption_window(
     clip_start: float, clip_end: float, segments: Optional[List[Dict]]
 ) -> bool:
     """Return whether at least one non-empty transcript segment overlaps a clip."""
-    for segment in segments or []:
+    clip_start = _finite_float(clip_start, 0.0)
+    clip_end = _finite_float(clip_end, clip_start)
+    if clip_end <= clip_start:
+        return False
+    segment_items = segments if isinstance(segments, (list, tuple)) else []
+    for segment in segment_items:
         if not isinstance(segment, dict):
             continue
         try:
@@ -430,7 +452,8 @@ def _reframe_vertical(
         ) from e
 
     target_ratio = _ratio(aspect_ratio)
-    if (layout or "single").strip().lower() == "split":
+    layout_name = str(layout or "single").strip().lower()
+    if layout_name == "split":
         ffmpeg = _find_ffmpeg()
         out_h = 1920
         out_w = max(2, int(round(out_h * target_ratio)) // 2 * 2)
@@ -438,11 +461,12 @@ def _reframe_vertical(
         split_filter = f"[0:v]crop=iw/2:ih:0:0,scale={half}:{out_h}:force_original_aspect_ratio=decrease,pad={half}:{out_h}:(ow-iw)/2:(oh-ih)/2[left];[0:v]crop=iw/2:ih:iw/2:0,scale={half}:{out_h}:force_original_aspect_ratio=decrease,pad={half}:{out_h}:(ow-iw)/2:(oh-ih)/2[right];[left][right]hstack=inputs=2[v]"
         subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", in_path, "-filter_complex", split_filter, "-map", "[v]", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-shortest", out_path], check=True)
         return out_path
-    if (fit_mode or "crop").strip().lower() == "fit_blur":
+    fit_name = str(fit_mode or "crop").strip().lower()
+    if fit_name == "fit_blur":
         ffmpeg = _find_ffmpeg()
         out_h = 1920
         out_w = max(2, int(round(out_h * target_ratio)) // 2 * 2)
-        zoom = max(0.5, min(1.5, float(zoom)))
+        zoom = max(0.5, min(1.5, _finite_float(zoom, 1.0)))
         filter_complex = (
             f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h},boxblur=20:10[bg];"
             f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,scale=iw*{zoom:.3f}:ih*{zoom:.3f}[fg];"
@@ -460,9 +484,14 @@ def _reframe_vertical(
     if not cap.isOpened():
         raise RuntimeError(f"could not open {in_path}")
 
-    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    src_w = int(max(0.0, round(_finite_float(cap.get(cv2.CAP_PROP_FRAME_WIDTH), 0.0))))
+    src_h = int(max(0.0, round(_finite_float(cap.get(cv2.CAP_PROP_FRAME_HEIGHT), 0.0))))
+    if src_w < 2 or src_h < 2:
+        cap.release()
+        raise RuntimeError(f"video has invalid dimensions ({src_w}x{src_h})")
+    fps = _finite_float(cap.get(cv2.CAP_PROP_FPS), 30.0)
+    if fps <= 0:
+        fps = 30.0
 
     # Compute the largest crop that fits inside the frame at the target ratio.
     if target_ratio < src_w / src_h:
@@ -471,8 +500,14 @@ def _reframe_vertical(
     else:
         crop_w = src_w
         crop_h = int(crop_w / target_ratio)
-    crop_w = max(2, crop_w - (crop_w % 2))
-    crop_h = max(2, crop_h - (crop_h % 2))
+    crop_w = min(src_w, max(2, crop_w - (crop_w % 2)))
+    crop_h = min(src_h, max(2, crop_h - (crop_h % 2)))
+    if crop_w % 2:
+        crop_w -= 1
+    if crop_h % 2:
+        crop_h -= 1
+    crop_w = max(2, crop_w)
+    crop_h = max(2, crop_h)
 
     face_cascade = None
     if auto_reframe:
@@ -514,7 +549,7 @@ def _reframe_vertical(
                     int(ly + (cy - ly) * smoothing),
                 )
         if last_center is None and not auto_reframe:
-            position = max(0.0, min(1.0, float(crop_position)))
+            position = max(0.0, min(1.0, _finite_float(crop_position, 0.5)))
             last_center = (int(crop_w / 2 + position * (src_w - crop_w)), src_h // 2)
         if last_center is None:
             last_center = (src_w // 2, src_h // 2)
@@ -577,6 +612,17 @@ def crop_clip_local(
     jump_cuts: bool = False,
 ) -> str:
     """Cut + reframe one highlight, optionally burning Whisper captions."""
+    source_path = str(source_path) if source_path is not None else ""
+    out_path = str(out_path) if out_path is not None else ""
+    start_time = _finite_float(start_time, -1.0)
+    end_time = _finite_float(end_time, -1.0)
+    if start_time < 0 or end_time <= start_time:
+        raise RuntimeError("invalid clip timestamps: end_time must be after start_time")
+    if not os.path.isfile(source_path):
+        raise RuntimeError(f"source video file not found: {source_path}")
+    if not out_path:
+        raise RuntimeError("clip output path is required")
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     for label, media in (
         ("background music", background_music),
         ("watermark", watermark),
@@ -812,19 +858,25 @@ def crop_highlights_local(
     out_dir = out_dir or LOCAL_OUTPUT_DIR
     os.makedirs(out_dir, exist_ok=True)
     results: List[Dict] = []
-    for i, h in enumerate(highlights, 1):
+    items = highlights if isinstance(highlights, (list, tuple)) else []
+    for i, h in enumerate(items, 1):
         out_path = os.path.join(out_dir, f"short_{i:02d}.mp4")
-        print(f"[clip/local] {i}/{len(highlights)}: {h.get('title', '(untitled)')}", flush=True)
+        if not isinstance(h, dict):
+            message = "highlight must be a JSON object"
+            print(f"[clip/local] {i} failed: {message}", flush=True)
+            results.append({"clip_url": None, "error": message})
+            continue
+        print(f"[clip/local] {i}/{len(items)}: {h.get('title', '(untitled)')}", flush=True)
         preexisting_output = os.path.isfile(out_path)
         try:
             start_time = float(h["start_time"])
             end_time = float(h["end_time"])
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
             message = f"invalid highlight timestamps: {exc}"
             print(f"[clip/local] {i} failed: {message}", flush=True)
             results.append({**h, "clip_url": None, "error": message})
             continue
-        if end_time <= start_time:
+        if not math.isfinite(start_time) or not math.isfinite(end_time) or end_time <= start_time:
             message = "invalid highlight timestamps: end_time must be after start_time"
             print(f"[clip/local] {i} failed: {message}", flush=True)
             results.append({**h, "clip_url": None, "error": message})

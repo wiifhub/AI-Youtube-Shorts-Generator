@@ -1,6 +1,8 @@
 """Lightweight local visual-event analysis for highlight ranking."""
 from __future__ import annotations
 
+import math
+import os
 from pathlib import Path
 from typing import Dict, List
 
@@ -12,14 +14,33 @@ def analyze_video(media_path: str, sample_seconds: float = 1.0) -> List[Dict]:
     except ImportError:
         return []
 
+    if not media_path or not os.path.isfile(media_path):
+        return []
     cap = cv2.VideoCapture(str(Path(media_path)))
     if not cap.isOpened():
         return []
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+    except (TypeError, ValueError, OverflowError):
+        fps = 30.0
+    if not math.isfinite(fps) or fps <= 0:
+        fps = 30.0
+    try:
+        frame_count = float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    except (TypeError, ValueError, OverflowError):
+        frame_count = 0.0
+    if not math.isfinite(frame_count) or frame_count < 0:
+        frame_count = 0.0
     duration = frame_count / fps if frame_count else 0.0
-    step = max(1, int(fps * max(0.25, sample_seconds)))
+    try:
+        sample_interval = float(sample_seconds)
+    except (TypeError, ValueError, OverflowError):
+        sample_interval = 1.0
+    if not math.isfinite(sample_interval):
+        sample_interval = 1.0
+    step = max(1, int(fps * max(0.25, sample_interval)))
     cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    cascade_ready = not cascade.empty()
     previous = None
     events: List[Dict] = []
     frame_index = 0
@@ -34,7 +55,11 @@ def analyze_video(media_path: str, sample_seconds: float = 1.0) -> List[Dict]:
             timestamp = frame_index / fps
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             small = cv2.resize(gray, (160, 90))
-            face_count = len(cascade.detectMultiScale(gray, 1.1, 5, minSize=(35, 35)))
+            face_count = (
+                len(cascade.detectMultiScale(gray, 1.1, 5, minSize=(35, 35)))
+                if cascade_ready
+                else 0
+            )
             if previous is not None:
                 change = float(cv2.absdiff(small, previous).mean())
                 if change >= 24.0:
@@ -58,14 +83,24 @@ def extract_thumbnail(media_path: str, timestamp: float, out_path: str, text: st
         import cv2  # type: ignore
     except ImportError as exc:
         raise RuntimeError("opencv-python is required for thumbnail extraction") from exc
+    if not media_path or not os.path.isfile(media_path):
+        raise RuntimeError(f"could not open {media_path}")
+    if not out_path:
+        raise RuntimeError("thumbnail output path is required")
     cap = cv2.VideoCapture(str(Path(media_path)))
     if not cap.isOpened():
         raise RuntimeError(f"could not open {media_path}")
-    cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(timestamp)) * 1000.0)
+    try:
+        timestamp_value = float(timestamp)
+    except (TypeError, ValueError, OverflowError):
+        timestamp_value = 0.0
+    if not math.isfinite(timestamp_value):
+        timestamp_value = 0.0
+    cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, timestamp_value) * 1000.0)
     ok, frame = cap.read()
     cap.release()
     if not ok:
-        raise RuntimeError(f"could not read thumbnail frame at {timestamp:.1f}s")
+        raise RuntimeError(f"could not read thumbnail frame at {timestamp_value:.1f}s")
     if text:
         import textwrap
         lines = textwrap.wrap(" ".join(str(text).split()), width=22)[:3]
@@ -74,6 +109,8 @@ def extract_thumbnail(media_path: str, timestamp: float, out_path: str, text: st
             cv2.putText(frame, line, (32, y), cv2.FONT_HERSHEY_DUPLEX, 1.4, (0, 0, 0), 8, cv2.LINE_AA)
             cv2.putText(frame, line, (32, y), cv2.FONT_HERSHEY_DUPLEX, 1.4, (255, 255, 255), 2, cv2.LINE_AA)
             y += 72
-    if not cv2.imwrite(str(out_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+    output_path = Path(str(out_path))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(output_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
         raise RuntimeError(f"could not write thumbnail {out_path}")
-    return out_path
+    return str(output_path)
