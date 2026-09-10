@@ -139,7 +139,7 @@ On Windows, from the downloaded/cloned project folder, double-click `install_win
 
 ### Portable Windows executable
 
-Download the current [ShortsStudio-v0.6.1-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.6.1/ShortsStudio-v0.6.1-windows.zip) and extract the entire ZIP. Open the `ShortsStudio` folder and double-click `unblock_and_start.bat`; it removes the download block from the extracted files and starts `ShortsStudio.exe`. You can also launch the executable directly after choosing **More info > Run anyway** once. Keep the whole folder together because it includes the runtime, CTranslate2, and FFmpeg binaries. Configure API keys in a `.env` file beside the executable when using local LLM ranking. Use **Quit Shorts Studio** in the page to stop the server cleanly.
+Download the current [ShortsStudio-v0.6.1-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.6.1/ShortsStudio-v0.6.1-windows.zip) and extract the entire ZIP. Open the `ShortsStudio` folder and double-click `unblock_and_start.bat`; it removes the download block from the extracted files and starts `ShortsStudio.exe`. You can also launch the executable directly after choosing **More info > Run anyway** once. Keep the whole folder together because it includes the runtime, CTranslate2, CUDA 12 runtime libraries, and FFmpeg binaries. Configure API keys in a `.env` file beside the executable when using local LLM ranking. Use **Quit Shorts Studio** in the page to stop the server cleanly.
 
 ### Installed Windows application
 
@@ -160,7 +160,7 @@ The web UI exposes Whisper model and device controls. `Auto` detects a usable CU
 
 ### Professional Windows installer
 
-The Releases page includes both a portable ZIP and `ShortsStudio-Setup-vX.Y.Z.exe`. The setup program installs the bundled runtime and FFmpeg, creates Start Menu and optional Desktop shortcuts, and registers a normal Windows uninstaller. To build it yourself, build the portable app first, install Inno Setup 6, then run `build_installer.bat` (or `ISCC.exe installer\\ShortsStudio.iss`).
+The Releases page includes both a portable ZIP and `ShortsStudio-Setup-vX.Y.Z.exe`. The setup program installs the bundled runtime and FFmpeg, creates Start Menu and optional Desktop shortcuts, and registers a normal Windows uninstaller. To build it yourself, run `build_portable.bat`, install Inno Setup 6, then run `build_installer.bat` (or `ISCC.exe installer\\ShortsStudio.iss`). `build_portable.bat` also copies the CUDA 12 runtime DLLs when Ollama or the CUDA toolkit is installed, preventing the `cublas64_12.dll` startup error.
 
 ### Windows SmartScreen
 
