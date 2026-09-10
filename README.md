@@ -324,6 +324,8 @@ Framing can be automatic (face tracking) or manual. Turn off **Auto frame faces*
 
 Project presets provide starting points for podcast/interview, educational, reaction/gaming, and story videos; every preset remains editable before submission.
 
+Use the web UI's optional **Save folder** field to choose a destination. Each job creates a timestamped subfolder containing the source cache, transcript, rendered shorts, thumbnails, and metadata.
+
 Local renders also accept optional intro and outro MP4 paths, and can apply FFmpeg noise reduction alongside loudness normalization.
 
 This project is licensed under the MIT License.

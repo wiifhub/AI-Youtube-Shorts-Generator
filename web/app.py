@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -129,6 +130,7 @@ class JobRequest(BaseModel):
     zoom: float = Field(1.0, ge=0.5, le=1.5)
     intro: Optional[str] = None
     outro: Optional[str] = None
+    save_folder: Optional[str] = None
 
 
 class BatchRequest(JobRequest):
@@ -156,6 +158,7 @@ def _job_snapshot(job: Dict[str, Any]) -> Dict[str, Any]:
         "result": job.get("result"),
         "created_at": job["created_at"],
         "request": job.get("request"),
+        "output_dir": job.get("output_dir"),
     }
 
 
@@ -216,8 +219,17 @@ def _run_job(job_id: str, req: JobRequest) -> None:
     try:
         _job_slots.acquire()
         progress("queued", "Starting pipeline…")
-        job_output_dir = _jobs_dir / job_id
+        if req.save_folder:
+            base = Path(req.save_folder).expanduser().resolve()
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            source_tag = re.sub(r"[^A-Za-z0-9_-]+", "_", req.url.rsplit("/", 1)[-1])[:32] or "source"
+            job_output_dir = base / f"{stamp}_shorts_{source_tag}_{job_id[:8]}"
+        else:
+            job_output_dir = _jobs_dir / job_id
         job_output_dir.mkdir(parents=True, exist_ok=True)
+        with _lock:
+            _jobs[job_id]["output_dir"] = str(job_output_dir)
+            _persist_job_locked(_jobs[job_id])
         result = generate_shorts(
             youtube_url=req.url.strip(),
             num_clips=req.num_clips,
@@ -242,6 +254,7 @@ def _run_job(job_id: str, req: JobRequest) -> None:
             zoom=req.zoom,
             intro=req.intro,
             outro=req.outro,
+            save_folder=req.save_folder,
         )
         public = {
             "mode": result.get("mode"),
@@ -323,6 +336,7 @@ def _enqueue_job(req: JobRequest) -> Dict[str, Any]:
                 "zoom": req.zoom,
                 "intro": req.intro,
                 "outro": req.outro,
+                "save_folder": req.save_folder,
             },
         }
         _cancel_events[job_id] = threading.Event()

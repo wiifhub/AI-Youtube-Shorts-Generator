@@ -181,6 +181,8 @@
 
         <label>Batch URLs or local paths (optional, one per line)</label>
         <textarea name="batch_urls" id="batchUrls" rows="3" placeholder="Paste multiple sources to queue them together"></textarea>
+        <label>Save folder (optional)</label>
+        <input name="save_folder" type="text" placeholder="C:\\Users\\You\\Videos\\Shorts" />
 
         <div class="row">
           <div>
@@ -635,6 +637,7 @@
       data.zoom = Number(form.elements.zoom.value);
       data.intro = String(data.intro || "").trim() || null;
       data.outro = String(data.outro || "").trim() || null;
+      data.save_folder = String(data.save_folder || "").trim() || null;
       data.normalize_audio = form.elements.normalize_audio.checked;
       data.denoise_audio = form.elements.denoise_audio.checked;
       data.remove_filler_words = form.elements.remove_filler_words.checked;
