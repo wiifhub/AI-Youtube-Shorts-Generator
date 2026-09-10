@@ -70,21 +70,21 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/SamurAIGPT/AI-Youtube-Shorts-Generator.git
+   git clone https://github.com/wiifhub/AI-Youtube-Shorts-Generator.git
    cd AI-Youtube-Shorts-Generator
    ```
 
 2. **Create and activate a virtual environment:**
    ```bash
-   python3.10 -m venv venv
-   source venv/bin/activate
+   python -m venv venv
+   # Windows PowerShell: .\\venv\\Scripts\\Activate.ps1
+   # macOS/Linux:      source venv/bin/activate
    ```
 
 3. **Install Python dependencies:**
    ```bash
-   pip install -r requirements.txt
-   # Only if you plan to use --mode local:
-   pip install -r requirements-local.txt
+   python -m pip install --upgrade pip
+   python -m pip install -r requirements-local.txt
    ```
 
 4. **Set up environment variables:**
@@ -108,6 +108,8 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
 ## Usage
 
 ### Web UI
+
+On Windows, from the downloaded/cloned project folder, double-click `install_windows.bat` once. It creates the virtual environment, installs all dependencies, and creates `.env` from `.env.example`. Then double-click `start_studio.bat` (or run `python -m web.app` inside the activated environment).
 
 Install deps, then:
 
