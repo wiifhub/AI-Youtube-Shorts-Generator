@@ -104,6 +104,17 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
 
 ## Usage
 
+### Web UI
+
+Install deps, then:
+
+```bash
+pip install -r requirements.txt
+python -m web.app
+```
+
+Open [http://127.0.0.1:7860](http://127.0.0.1:7860). Paste a YouTube URL, choose local or API mode, or drag in a video file. The UI supports caption presets (Bold, Clean, Boxed, Karaoke), highlight focus modes, silence/audio cleanup, batch sources, manual per-clip timestamp edits, and creator metadata. Jobs and results are saved under `output/jobs/`, so refreshing or reopening the UI keeps the recent-job history and playable local clips. Completed jobs can be downloaded as a ZIP containing local clips and `metadata.json`.
+
 ### Single video (API mode — default)
 
 ```bash
@@ -116,7 +127,7 @@ python main.py "https://www.youtube.com/watch?v=VIDEO_ID"
 python main.py "https://www.youtube.com/watch?v=VIDEO_ID" --mode local
 ```
 
-Local mode writes the rendered shorts to `./output/short_01.mp4`, `short_02.mp4`, … (override with `LOCAL_OUTPUT_DIR`).
+Local mode writes the rendered shorts to `./output/short_01.mp4`, `short_02.mp4`, … (override with `LOCAL_OUTPUT_DIR`). The web UI uses an isolated `output/jobs/<job-id>/` directory per run. When transcript segments are available, local clips include burned-in captions generated through ffmpeg/libass; set `LOCAL_BURN_CAPTIONS=false` to disable them.
 
 ### With options
 
@@ -295,6 +306,16 @@ The [AI Clipping API](https://muapi.ai/playground/ai-clipping?utm_source=github&
 Contributions are welcome! Please fork the repository and submit a pull request.
 
 ## License
+
+## Shorts Studio upgrades
+
+Local mode can add visual scene/speaker signals to highlight ranking, generate a thumbnail per clip, burn ASS captions (including karaoke word timing), trim silence, normalize loudness, remove filler words from captions, mix optional background music, and overlay a watermark. The web UI persists jobs, supports drag-and-drop uploads, batch queues, cancellation, timeline review, per-clip regeneration, and ZIP export. Background music and watermark fields accept paths visible to the running machine and apply to local renders.
+
+Framing can be automatic (face tracking) or manual. Turn off **Auto frame faces** in the web UI and use the **Manual crop position** slider to choose the left, center, or right composition.
+
+Project presets provide starting points for podcast/interview, educational, reaction/gaming, and story videos; every preset remains editable before submission.
+
+Local renders also accept optional intro and outro MP4 paths, and can apply FFmpeg noise reduction alongside loudness normalization.
 
 This project is licensed under the MIT License.
 

@@ -44,6 +44,7 @@ HIGHLIGHT_SYSTEM_PROMPT = """You are an elite short-form video editor who has st
 {virality_criteria}
 
 Content type: {content_type} | Density: {density}
+Selection focus: {focus_instruction}
 
 Your task: identify the most viral-worthy highlights from the transcript.
 
@@ -173,7 +174,16 @@ def detect_content_type(transcript: Dict, llm_fn: LLMFn = call_muapi_llm) -> Dic
 
 def build_transcript_text(transcript: Dict) -> str:
     segments = transcript.get("segments", [])
-    return "\n".join(f"[{s['start']:.1f}s] {s['text'].strip()}" for s in segments)
+    text = "\n".join(f"[{s['start']:.1f}s] {s['text'].strip()}" for s in segments)
+    visual_events = transcript.get("visual_events") or []
+    if visual_events:
+        text += "\n\nVisual signals (use as supporting evidence, not as guaranteed context):\n"
+        text += "\n".join(
+            f"[{float(event.get('time', 0.0)):.1f}s] {event.get('type', 'visual_event')}"
+            for event in visual_events[:400]
+            if isinstance(event, dict)
+        )
+    return text
 
 
 def chunk_transcript(transcript: Dict) -> List[Dict]:
@@ -204,17 +214,28 @@ def call_highlight_api(
     num_clips: int,
     is_chunk: bool = False,
     llm_fn: LLMFn = call_muapi_llm,
+    focus: str = "balanced",
 ) -> Dict:
     # Ask for ~2× the user's target so dedupe has headroom, but cap so the model
     # doesn't have to generate a huge JSON payload (which times out gpt-5-mini).
     target = max(num_clips * 2, 5)
     natural_max = max(2 if is_chunk else 3, int(duration / 90))
     min_clips = min(target, natural_max, 8)
+    focus_instructions = {
+        "balanced": "balance hooks, emotion, novelty, conflict, and practical value",
+        "educational": "favor clear teachable insights, steps, facts, and useful takeaways",
+        "funny": "favor laughter, surprise, reactions, witty lines, and comedic timing",
+        "story": "favor vulnerability, narrative build-up, emotional turns, and satisfying payoffs",
+        "controversial": "favor strong opinions, disagreement, debate, and counter-intuitive claims",
+        "visual": "favor energetic moments, expressive reactions, reveals, and visually motivated beats",
+    }
+    normalized_focus = (focus or "balanced").strip().lower()
     system = HIGHLIGHT_SYSTEM_PROMPT.format(
         virality_criteria=VIRALITY_CRITERIA,
         content_type=content_info.get("content_type", "other"),
         density=content_info.get("density", "medium"),
         num_clips_instruction=f"Generate at least {min_clips} highlights",
+        focus_instruction=focus_instructions.get(normalized_focus, focus_instructions["balanced"]),
     )
     base_prompt = f"{system}\n\nTranscript:\n{transcript_text}"
     prompt = base_prompt
@@ -269,10 +290,76 @@ def dedupe_highlights(highlights: List[Dict]) -> List[Dict]:
     return kept
 
 
+def snap_highlight_boundaries(
+    highlights: List[Dict], transcript: Dict
+) -> List[Dict]:
+    """Snap model timestamps to the nearest Whisper segment boundaries.
+
+    LLM timestamps are useful estimates, but they frequently land in the
+    middle of a spoken sentence.  Whisper already gives us stable segment
+    boundaries, so use the nearest segment start for a clip start and the
+    nearest segment end for a clip end.  If a malformed/very short candidate
+    would invert after snapping, retain its original timestamps instead of
+    dropping an otherwise useful highlight.
+    """
+    segments = transcript.get("segments") or []
+    starts: List[float] = []
+    ends: List[float] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        try:
+            start = float(segment.get("start", 0.0))
+            end = float(segment.get("end", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if start < end:
+            starts.append(start)
+            ends.append(end)
+
+    if not starts or not ends:
+        return [dict(h) for h in highlights]
+
+    starts.sort()
+    ends.sort()
+
+    def nearest(value: float, choices: List[float]) -> float:
+        return min(choices, key=lambda candidate: (abs(candidate - value), candidate))
+
+    snapped: List[Dict] = []
+    for highlight in highlights:
+        try:
+            original_start = float(highlight["start_time"])
+            original_end = float(highlight["end_time"])
+        except (KeyError, TypeError, ValueError):
+            snapped.append(dict(highlight))
+            continue
+
+        start = nearest(original_start, starts)
+        end = nearest(original_end, ends)
+        if end <= start:
+            # Keep the candidate valid if a short highlight has crossed after
+            # independent nearest-boundary snapping.
+            valid_ends = [candidate for candidate in ends if candidate > start]
+            if valid_ends:
+                end = nearest(original_end, valid_ends)
+            else:
+                start = original_start
+                end = original_end
+
+        item = dict(highlight)
+        item["start_time"] = start
+        item["end_time"] = end
+        snapped.append(item)
+
+    return snapped
+
+
 def get_highlights(
     transcript: Dict,
     num_clips: int = 3,
     llm_fn: Optional[LLMFn] = None,
+    focus: str = "balanced",
 ) -> Dict:
     """Main entry point — returns {highlights: [...]} sorted by score.
 
@@ -289,18 +376,61 @@ def get_highlights(
         print(f"[highlights] long video — splitting into {len(chunks)} chunks", flush=True)
         all_highlights: List[Dict] = []
         for i, chunk in enumerate(chunks):
-            offset = chunk.get("_offset", 0)
+            offset = float(chunk.get("_offset", 0))
+            chunk_duration = float(chunk.get("duration", 0))
             text = build_transcript_text(chunk)
             print(f"[highlights] chunk {i + 1}/{len(chunks)} (offset {offset:.0f}s)", flush=True)
-            result = call_highlight_api(text, content_info, chunk["duration"], num_clips=num_clips, is_chunk=True, llm_fn=llm_fn)
-            for h in result.get("highlights", []):
-                h["start_time"] = float(h["start_time"]) + offset
-                h["end_time"] = float(h["end_time"]) + offset
-                all_highlights.append(h)
+            # Segment timestamps embedded in the transcript text are absolute
+            # (relative to the full video). Validate against the FULL video
+            # duration so later-chunk absolute times are not discarded.
+            try:
+                result = call_highlight_api(
+                    text,
+                    content_info,
+                    duration,
+                    num_clips=num_clips,
+                    is_chunk=True,
+                    llm_fn=llm_fn,
+                    focus=focus,
+                )
+            except RuntimeError as e:
+                # One bad chunk shouldn't kill the whole run if others worked.
+                print(f"[highlights] chunk {i + 1}/{len(chunks)} failed: {e}", flush=True)
+                continue
+
+            chunk_highlights = result.get("highlights", [])
+            # Models sometimes return chunk-relative times (0-based) and
+            # sometimes absolute times matching the transcript. Detect and
+            # normalize so either shape lands on the correct absolute window.
+            if offset > 0 and chunk_highlights:
+                max_end = max(float(h["end_time"]) for h in chunk_highlights)
+                looks_relative = max_end <= chunk_duration + 5.0
+                if looks_relative:
+                    for h in chunk_highlights:
+                        h["start_time"] = float(h["start_time"]) + offset
+                        h["end_time"] = float(h["end_time"]) + offset
+
+            all_highlights.extend(chunk_highlights)
+
+        if not all_highlights:
+            raise RuntimeError(
+                "Highlight generator returned zero clips across all chunks."
+            )
         highlights = dedupe_highlights(all_highlights)
     else:
         text = build_transcript_text(transcript)
-        result = call_highlight_api(text, content_info, duration, num_clips=num_clips, llm_fn=llm_fn)
+        result = call_highlight_api(
+            text,
+            content_info,
+            duration,
+            num_clips=num_clips,
+            llm_fn=llm_fn,
+            focus=focus,
+        )
         highlights = dedupe_highlights(result.get("highlights", []))
 
-    return {"highlights": highlights}
+    # Snap only after dedupe so overlap suppression is based on the model's
+    # intended windows, then dedupe once more in case adjacent candidates land
+    # on the same Whisper boundaries.
+    highlights = snap_highlight_boundaries(highlights, transcript)
+    return {"highlights": dedupe_highlights(highlights)}

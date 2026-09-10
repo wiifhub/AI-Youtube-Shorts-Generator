@@ -110,7 +110,7 @@ def download_youtube_local(video_url: str, fmt: str = "720", out_dir: Optional[s
             print(f"[download/local] reusing cached download: {cached}", flush=True)
             return cached
 
-    print(f"[download/local] {video_url} @ {fmt}p → {out_dir}/", flush=True)
+    print(f"[download/local] {video_url} @ {fmt}p -> {out_dir}/", flush=True)
     ydl_opts = {
         "format": _format_for(fmt),
         "outtmpl": os.path.join(out_dir, "source_%(id)s.%(ext)s"),
@@ -118,18 +118,38 @@ def download_youtube_local(video_url: str, fmt: str = "720", out_dir: Optional[s
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
+        # YouTube now requires solving a JS "n" challenge to unlock most
+        # formats. Without a JS runtime + solver script, yt-dlp reports
+        # perfectly-playable videos as "not available". See:
+        # https://github.com/yt-dlp/yt-dlp/wiki/EJS
+        "js_runtimes": {"node": {"path": None}},
+        "remote_components": ["ejs:github"],
+        # The default Android client can return format URLs that YouTube
+        # rejects with HTTP 403 from some networks. The embedded web client
+        # currently provides a playable, challenge-solved fallback.
+        "extractor_args": {"youtube": {"player_client": ["web_embedded"]}},
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=True)
-        path = ydl.prepare_filename(info)
-        # merge_output_format may rename the extension after merge
-        if not os.path.exists(path):
-            stem, _ = os.path.splitext(path)
-            for ext in (".mp4", ".mkv", ".webm"):
-                if os.path.exists(stem + ext):
-                    path = stem + ext
-                    break
-
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=True)
+            path = ydl.prepare_filename(info)
+            # merge_output_format may rename the extension after merge
+            if not os.path.exists(path):
+                stem, _ = os.path.splitext(path)
+                for ext in (".mp4", ".mkv", ".webm"):
+                    if os.path.exists(stem + ext):
+                        path = stem + ext
+                        break
+    except Exception as exc:
+        message = str(exc)
+        if "403" in message or "Forbidden" in message:
+            raise RuntimeError(
+                "YouTube refused the download (HTTP 403). The embedded client "
+                "was tried automatically; try again later or drag the video file "
+                "into Shorts Studio instead. If it only fails for age-restricted "
+                "videos, configure yt-dlp browser cookies on the machine running the app."
+            ) from exc
+        raise
     print(f"[download/local] ready: {path}", flush=True)
     return path
