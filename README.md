@@ -162,6 +162,10 @@ The web UI exposes Whisper model and device controls. `Auto` detects a usable CU
 
 The Releases page includes both a portable ZIP and `ShortsStudio-Setup-vX.Y.Z.exe`. The setup program installs the bundled runtime and FFmpeg, creates Start Menu and optional Desktop shortcuts, and registers a normal Windows uninstaller. To build it yourself, build the portable app first, install Inno Setup 6, then run `build_installer.bat` (or `ISCC.exe installer\\ShortsStudio.iss`).
 
+### Windows SmartScreen
+
+The portable executable and installer are not digitally signed in this repository, so a fresh download can show **Windows protected your PC** with **Unknown publisher**. This is a Windows reputation warning, not an application error. For the portable ZIP, extract the complete folder and double-click `unblock_and_start.bat`; it removes the download block from the extracted files and starts Shorts Studio. If Windows still prompts, choose **More info > Run anyway** once. The same one-time prompt may appear for the installer. Removing the warning permanently requires an Authenticode certificate issued to `wiifhub`; a self-signed certificate would not be trusted by Windows SmartScreen.
+
 ### Single video (API mode — default)
 
 ```bash
