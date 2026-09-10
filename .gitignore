@@ -4,5 +4,10 @@ __pycache__/
 .venv/
 venv/
 output/
+build/
+dist/
+release/
+*.spec
+*.zip
 *.mp4
 .DS_Store

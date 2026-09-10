@@ -52,6 +52,19 @@ Built for creators, agencies, and developers who don't want to pay $20–$300/mo
 - **🧰 CLI + Python Library**: Use it from the shell or import `generate_shorts(...)` into your own pipeline
 - **📦 JSON Output**: `--output-json` dumps the full result (transcript + every candidate highlight + final clip URLs/paths) for downstream automation
 
+### Shorts Studio web features
+
+The local web application adds the complete creator workflow:
+
+- Drag-and-drop video uploads, local paths, batch URLs, persistent jobs, cancellation, and recent-job history.
+- Caption presets (Bold, Clean, Boxed, Karaoke) plus custom font, size, color, safe position, word timing, and filler-word cleanup.
+- Auto face framing toggle, manual crop position, crop-to-fill, zoom-out with blurred background, foreground zoom, and two-panel split layout.
+- Preview rendering, transcript timeline, sentence-boundary snapping, editable timestamps, per-clip regeneration, undo history, and ZIP export.
+- Silence trimming, real silent-video jump cuts, loudness normalization, noise reduction, background music, watermark, intro/outro, and automatic thumbnails.
+- Project presets for podcast/interview, educational, reaction/gaming, and story videos; generated titles, descriptions, hashtags, and platform publishing metadata.
+- Optional Save folder creates named job folders such as `20260910_214500_shorts_source_a1b2c3d4` containing source cache, transcript, clips, thumbnails, and metadata.
+- Whisper model/device controls (`tiny` through `large-v3`; Auto, CPU, or CUDA) with live CUDA status and safe CPU fallback.
+
 ## Quick Start (No Setup)
 
 Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-clipping?utm_source=github&utm_medium=readme&utm_campaign=ai-youtube-shorts-generator) gives you the same Opus Clip–style pipeline as a single HTTP call — no Python, no dependencies, pay-per-clip instead of monthly subscriptions.
@@ -113,9 +126,13 @@ On Windows, from the downloaded/cloned project folder, double-click `install_win
 
 ### Portable Windows executable
 
-Download `ShortsStudio-v0.3.0-windows.zip` from the Releases page and extract the entire ZIP. Open the `ShortsStudio` folder and double-click `ShortsStudio.exe`; it starts the local server and opens the browser automatically. Keep the whole folder together because it includes the runtime and FFmpeg binaries. Configure API keys in a `.env` file beside the executable when using local LLM ranking.
+Download the current [ShortsStudio-v0.5.1-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.5.1/ShortsStudio-v0.5.1-windows.zip) and extract the entire ZIP. Open the `ShortsStudio` folder and double-click `ShortsStudio.exe`; it starts the local server and opens the browser automatically. Keep the whole folder together because it includes the runtime, CTranslate2, and FFmpeg binaries. Configure API keys in a `.env` file beside the executable when using local LLM ranking. Use **Quit Shorts Studio** in the page to stop the server cleanly.
 
-Install deps, then:
+### Installed Windows application
+
+For a normal Windows installation, download [ShortsStudio-Setup-v0.5.1.exe](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.5.1/ShortsStudio-Setup-v0.5.1.exe). The installer adds a Start Menu entry, offers a Desktop shortcut, installs the bundled runtime and FFmpeg, and registers an uninstaller. The app still runs locally at `http://127.0.0.1:7860`; no cloud account is required for the UI.
+
+For a source checkout, install dependencies, then:
 
 ```bash
 pip install -r requirements.txt
@@ -218,6 +235,24 @@ xargs -a urls.txt -I{} python main.py "{}"
 | Output | hosted URLs | local mp4 paths |
 | Required keys | `MUAPI_API_KEY` | `OPENAI_API_KEY` or `GEMINI_API_KEY` (+ `ffmpeg` on PATH) |
 
+## Shorts Studio HTTP API
+
+When the web app is running, these local routes are available:
+
+| Route | Purpose |
+|---|---|
+| `GET /api/health` | Confirm the server and output directory |
+| `GET /api/system` | FFmpeg, Whisper, CUDA, disk, and concurrency status |
+| `GET /api/diagnostics` | Runtime paths, job counts, and diagnostics |
+| `POST /api/jobs` | Queue one URL or local video |
+| `POST /api/jobs/batch` | Queue multiple sources |
+| `GET /api/jobs` | List persisted recent jobs |
+| `POST /api/jobs/{id}/preview` | Render a review preview |
+| `POST /api/jobs/{id}/clips/{index}` | Regenerate one edited clip |
+| `POST /api/jobs/{id}/clips/{index}/undo` | Restore the previous clip version |
+| `GET /api/jobs/{id}/export` | Download clips, thumbnails, and publishing metadata as ZIP |
+| `POST /api/shutdown` | Stop a local/portable server cleanly |
+
 ## How It Works
 
 1. **Download**: Fetches the source video from YouTube
@@ -287,6 +322,8 @@ Edit `shorts_generator/config.py` (or set env vars):
 ### Whisper transcription
 Audio is transcribed by MuAPI's `/openai-whisper` endpoint (server-side `whisper-1`). Pass `--language <code>` to lock the recognition to a specific language; otherwise it auto-detects.
 
+For Local mode, the web UI lets you choose `tiny`, `base`, `small`, `medium`, or `large-v3`, plus `Auto`, `CPU`, or `CUDA GPU`. Auto checks CTranslate2's CUDA runtime and falls back to CPU. The status line shows the detected device; the released Windows executable was verified to detect one CUDA device on the build machine.
+
 ## Project Structure
 
 ```
@@ -310,7 +347,19 @@ AI-Youtube-Shorts-Generator/
         └── clipper.py            ffmpeg cut + OpenCV vertical crop
 ```
 
+### Windows packaging files
+
+- `launcher.py` is the PyInstaller entry point for the portable executable.
+- `install_windows.bat` creates a source-install virtual environment.
+- `install_gpu_windows.bat` adds optional CUDA-enabled PyTorch diagnostics for source installs.
+- `installer/ShortsStudio.iss` and `build_installer.bat` build the Inno Setup installer.
+- `requirements-gpu.txt` documents the optional GPU dependency; the released EXE already bundles CUDA-capable CTranslate2.
+
 ## Troubleshooting
+
+### YouTube returns HTTP 403
+
+Update the source checkout and restart Shorts Studio so yt-dlp uses the current downloader client. Age-restricted or private videos may still reject downloads; use **Choose video** or drag the local MP4 into the UI instead.
 
 ### Whisper produced no segments
 The video may have no detectable speech, or it may be in a language Whisper struggles with. Try passing `--language en` (or the correct ISO-639-1 code) to skip auto-detection.
@@ -337,6 +386,10 @@ Use the web UI's optional **Save folder** field to choose a destination. Each jo
 Clip edits can be previewed, regenerated, and reverted with the per-clip **Undo** action.
 
 Local renders also accept optional intro and outro MP4 paths, and can apply FFmpeg noise reduction alongside loudness normalization.
+
+The generated ZIP includes `metadata.json` plus platform-ready title, description, hashtag, and thumbnail-hook metadata for YouTube Shorts, TikTok, and Instagram Reels. Preview and regeneration use the same framing, captions, audio, and layout settings as the final render.
+
+To close the standalone app, click **Quit Shorts Studio** in the web page. It stops the local server and leaves a clear closed confirmation page; closing the browser tab alone does not stop a manually launched server.
 
 This project is licensed under the MIT License.
 
