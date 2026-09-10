@@ -487,6 +487,9 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
             out_path = old_path if old_path and not old_path.startswith("http") else str(
                 _jobs_dir / job_id / f"short_{index + 1:02d}.mp4"
             )
+            undo_path = out_path + ".undo.mp4"
+            if os.path.isfile(out_path):
+                shutil.copyfile(out_path, undo_path)
             Path(out_path).parent.mkdir(parents=True, exist_ok=True)
             crop_clip_local(
                 str(source),
@@ -523,6 +526,7 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
                 "clip_url": out_path,
                 "captions_burned": bool(LOCAL_BURN_CAPTIONS and transcript.get("segments")),
             }
+            replacement["undo_path"] = undo_path if os.path.isfile(undo_path) else None
             try:
                 from shorts_generator.local.visual import extract_thumbnail
 
@@ -564,6 +568,30 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
         job["result"] = result
         job["message"] = f"Regenerated clip {index + 1}"
         job["logs"].append({"t": time.time(), "stage": "edit", "message": job["message"]})
+        _persist_job_locked(job)
+        return _job_snapshot(job)
+
+
+@app.post("/api/jobs/{job_id}/clips/{index}/undo")
+def undo_clip(job_id: str, index: int) -> Dict[str, Any]:
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "job not found")
+        shorts = list(job.get("raw_shorts") or [])
+        if index < 0 or index >= len(shorts):
+            raise HTTPException(404, "clip not found")
+        item = dict(shorts[index])
+        undo_path = str(item.get("undo_path") or "")
+        clip_path = str(item.get("clip_url") or "")
+        if not undo_path or not os.path.isfile(undo_path) or not clip_path:
+            raise HTTPException(400, "no previous clip version is available")
+        shutil.copyfile(undo_path, clip_path)
+        item.pop("undo_path", None)
+        shorts[index] = item
+        job["raw_shorts"] = shorts
+        if job.get("result"):
+            job["result"]["shorts"] = _public_shorts(shorts, job_id)
         _persist_job_locked(job)
         return _job_snapshot(job)
 

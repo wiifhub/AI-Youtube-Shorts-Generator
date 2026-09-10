@@ -421,7 +421,7 @@
             <div class="why">${escapeHtml(s.virality_reason || "")}</div>
             ${s.captions_burned ? `<div class="caption-note">Captions burned in</div>` : ""}
             ${s.creator_metadata ? `<div class="creator"><strong>Title:</strong> ${escapeHtml(s.creator_metadata.title)}<br><strong>Tags:</strong> ${escapeHtml(s.creator_metadata.hashtags)}</div>` : ""}
-            <div class="editor"><input type="number" min="0" step="0.1" data-start value="${Number(s.start_time || 0).toFixed(1)}" /><input type="number" min="0.1" step="0.1" data-end value="${Number(s.end_time || 0).toFixed(1)}" /><select data-fit><option value="crop">Crop</option><option value="fit_blur">Fit + blur</option></select><input type="range" min="0" max="1" step="0.01" value="0.5" data-position title="Manual position" /><input type="range" min="0.5" max="1.5" step="0.01" value="1" data-zoom title="Zoom" /><button type="button" data-preview="${i}">Preview</button><button type="button" data-regenerate="${i}">Regenerate</button></div>
+            <div class="editor"><input type="number" min="0" step="0.1" data-start value="${Number(s.start_time || 0).toFixed(1)}" /><input type="number" min="0.1" step="0.1" data-end value="${Number(s.end_time || 0).toFixed(1)}" /><select data-fit><option value="crop">Crop</option><option value="fit_blur">Fit + blur</option></select><input type="range" min="0" max="1" step="0.01" value="0.5" data-position title="Manual position" /><input type="range" min="0.5" max="1.5" step="0.01" value="1" data-zoom title="Zoom" /><button type="button" data-preview="${i}">Preview</button><button type="button" data-regenerate="${i}">Regenerate</button><button type="button" data-undo="${i}">Undo</button></div>
             ${safeUrl ? `<a class="dl" href="${safeUrl}" download>Download mp4</a>` : ""}
           </div>
         </article>`;
@@ -431,6 +431,9 @@
       });
       results.querySelectorAll("[data-preview]").forEach(button => {
         button.addEventListener("click", () => previewClip(jobId, Number(button.dataset.preview), button));
+      });
+      results.querySelectorAll("[data-undo]").forEach(button => {
+        button.addEventListener("click", () => undoClip(jobId, Number(button.dataset.undo), button));
       });
       const timelineButton = results.querySelector("[data-show-timeline]");
       if (timelineButton) timelineButton.addEventListener("click", () => loadTimeline(jobId, timelineButton));
@@ -599,6 +602,16 @@
         const video = card.querySelector("video"); video.src = `${data.preview_url}?t=${Date.now()}`; video.load(); video.play().catch(() => {});
       } catch (err) { button.textContent = err.message; }
       finally { button.disabled = false; if (button.textContent === "Previewing…") button.textContent = "Preview"; }
+    }
+
+    async function undoClip(jobId, index, button) {
+      button.disabled = true;
+      try {
+        const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/clips/${index}/undo`, { method: "POST" });
+        const job = await response.json(); if (!response.ok) throw new Error(job.detail || "Undo unavailable");
+        setStatus(job);
+      } catch (err) { button.textContent = err.message; }
+      finally { button.disabled = false; }
     }
 
     pickFile.addEventListener("click", () => fileInput.click());
