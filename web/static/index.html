@@ -153,6 +153,7 @@
         <div class="logo">Shorts <span>Studio</span></div>
         <div class="sub">Paste a YouTube URL. Get ranked 9:16 clips with hooks, scores, and downloads.</div>
         <div class="system-status" id="systemStatus">Checking local tools…</div>
+        <button type="button" class="quit" id="quitApp">Quit Shorts Studio</button>
       </div>
     </header>
 
@@ -313,6 +314,7 @@
     const uploadStatus = document.getElementById("uploadStatus");
     const cancelJobButton = document.getElementById("cancelJob");
     const systemStatus = document.getElementById("systemStatus");
+    const quitApp = document.getElementById("quitApp");
     const preset = document.getElementById("preset");
     const autoReframe = form.elements.auto_reframe;
     const cropPosition = form.elements.crop_position;
@@ -323,6 +325,12 @@
     let activeJobId = null;
     let pollBusy = false;
     let uploading = false;
+    quitApp.addEventListener("click", async () => {
+      if (!confirm("Close Shorts Studio?")) return;
+      quitApp.disabled = true; quitApp.textContent = "Closing…";
+      try { await fetch("/api/shutdown", { method: "POST" }); }
+      finally { document.body.innerHTML = "<main style='font-family:system-ui;padding:3rem;text-align:center'><h2>Shorts Studio closed</h2><p>You can close this browser tab.</p></main>"; }
+    });
 
     function updateCropControl() {
       const value = Number(cropPosition.value);

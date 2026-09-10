@@ -709,6 +709,13 @@ def health() -> Dict[str, str]:
     return {"status": "ok", "output": str(Path(LOCAL_OUTPUT_DIR).resolve())}
 
 
+@app.post("/api/shutdown")
+def shutdown() -> Dict[str, str]:
+    """Stop this local-only server (used by the portable launcher Quit button)."""
+    threading.Timer(0.25, lambda: os._exit(0)).start()
+    return {"status": "shutting_down"}
+
+
 @app.get("/api/system")
 def system_status() -> Dict[str, Any]:
     usage = shutil.disk_usage(_output_root)
