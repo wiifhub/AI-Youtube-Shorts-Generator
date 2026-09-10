@@ -841,6 +841,19 @@ def diagnostics() -> Dict[str, Any]:
     }
 
 
+@app.get("/api/update")
+def update_check() -> Dict[str, Any]:
+    """Check the public GitHub release without downloading or changing files."""
+    import requests
+    try:
+        response = requests.get("https://api.github.com/repos/wiifhub/AI-Youtube-Shorts-Generator/releases/latest", timeout=8)
+        response.raise_for_status()
+        release = response.json()
+        return {"available": True, "tag": release.get("tag_name"), "url": release.get("html_url"), "name": release.get("name")}
+    except Exception as exc:
+        return {"available": False, "error": str(exc)}
+
+
 def main() -> None:
     import uvicorn
 
