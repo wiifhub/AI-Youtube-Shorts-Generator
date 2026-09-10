@@ -534,6 +534,15 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
                 "end_time": update.end_time,
                 "clip_url": out_path,
                 "captions_burned": bool(LOCAL_BURN_CAPTIONS and transcript.get("segments")),
+                "fit_mode": update.fit_mode,
+                "zoom": update.zoom,
+                "crop_position": update.crop_position,
+                "caption_style": style,
+                "caption_position": update.caption_position,
+                "caption_font": update.caption_font,
+                "caption_size": update.caption_size,
+                "caption_color": update.caption_color,
+                "layout": update.layout,
             }
             replacement["undo_path"] = undo_path if os.path.isfile(undo_path) else None
             try:
@@ -551,6 +560,15 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
                 **old,
                 "start_time": update.start_time,
                 "end_time": update.end_time,
+                "fit_mode": update.fit_mode,
+                "zoom": update.zoom,
+                "crop_position": update.crop_position,
+                "caption_style": style,
+                "caption_position": update.caption_position,
+                "caption_font": update.caption_font,
+                "caption_size": update.caption_size,
+                "caption_color": update.caption_color,
+                "layout": update.layout,
                 "clip_url": crop_clip(
                     str(source),
                     update.start_time,
