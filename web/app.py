@@ -721,8 +721,14 @@ def preview_clip(job_id: str, update: ClipUpdate) -> Dict[str, Any]:
         transcript = dict(job.get("raw_transcript") or {})
     if not source or not Path(str(source)).is_file():
         raise HTTPException(400, "a completed local job is required for preview")
+    duration = float(transcript.get("duration") or 0.0)
+    if duration and update.end_time > duration + 0.25:
+        raise HTTPException(400, f"end_time must be within the {duration:.1f}s source")
     if update.end_time <= update.start_time + 0.1:
         raise HTTPException(400, "end_time must be at least 0.1s after start_time")
+    style = (update.caption_style or str(request.get("caption_style") or "bold")).strip().lower()
+    if style not in {"clean", "bold", "boxed", "karaoke"}:
+        raise HTTPException(400, "caption_style must be clean, bold, boxed, or karaoke")
     from shorts_generator.local.clipper import crop_clip_local
     preview = _jobs_dir / job_id / "preview.mp4"
     crop_clip_local(
@@ -730,11 +736,11 @@ def preview_clip(job_id: str, update: ClipUpdate) -> Dict[str, Any]:
         str(request.get("aspect_ratio") or "9:16"), str(preview),
         caption_segments=list(transcript.get("segments") or []),
         burn_captions=LOCAL_BURN_CAPTIONS,
-        caption_style=update.caption_style or str(request.get("caption_style") or "bold"),
-        caption_position=str(request.get("caption_position") or "bottom"),
-        caption_font=str(request.get("caption_font") or "Arial"),
-        caption_size=int(request.get("caption_size") or 0),
-        caption_color=request.get("caption_color") or None,
+        caption_style=style,
+        caption_position=update.caption_position,
+        caption_font=update.caption_font,
+        caption_size=update.caption_size,
+        caption_color=update.caption_color,
         auto_reframe=bool(request.get("auto_reframe", True)),
         crop_position=update.crop_position, fit_mode=update.fit_mode, zoom=update.zoom,
         layout=update.layout,

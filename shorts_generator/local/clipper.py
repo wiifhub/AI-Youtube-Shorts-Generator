@@ -107,6 +107,18 @@ def _escape_ass_text(value: object, remove_filler_words: bool = False) -> str:
     return r"\N".join(wrapped) if wrapped else ""
 
 
+def _has_audio_stream(media_path: str) -> bool:
+    """Return whether FFmpeg can see an audio stream in a media file."""
+    ffmpeg = _find_ffmpeg()
+    probe = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", media_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return bool(re.search(r"Stream .*?: Audio:", probe.stderr or ""))
+
+
 def _caption_style_values(style: str, position: str = "bottom") -> Tuple[int, str, str, str, int, int, int]:
     """Return font/style values for a named caption preset."""
     presets = {
@@ -411,6 +423,9 @@ def _reframe_vertical(
     silent_path = out_path + ".silent.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(silent_path, fourcc, fps, (crop_w, crop_h))
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError(f"could not create temporary video writer for {out_path}")
 
     last_center: Optional[Tuple[int, int]] = None
     smoothing = 0.15  # how aggressively to chase a new face position
@@ -465,8 +480,11 @@ def _reframe_vertical(
         "-shortest",
         out_path,
     ]
-    subprocess.run(cmd, check=True)
-    _remove_with_retry(silent_path)
+    try:
+        subprocess.run(cmd, check=True)
+    finally:
+        if os.path.exists(silent_path):
+            _remove_with_retry(silent_path)
     return out_path
 
 
@@ -543,56 +561,73 @@ def crop_clip_local(
         audio_filters.append("afftdn=nf=-25")
     if audio_filters:
         processed_path = out_path + ".audio.mp4"
-        ffmpeg = _find_ffmpeg()
-        subprocess.run(
-            [
-                ffmpeg, "-y", "-loglevel", "error", "-i", out_path,
-                "-af", ",".join(audio_filters), "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "128k", processed_path,
-            ],
-            check=True,
-        )
-        os.replace(processed_path, out_path)
+        try:
+            ffmpeg = _find_ffmpeg()
+            subprocess.run(
+                [
+                    ffmpeg, "-y", "-loglevel", "error", "-i", out_path,
+                    "-af", ",".join(audio_filters), "-c:v", "copy",
+                    "-c:a", "aac", "-b:a", "128k", processed_path,
+                ],
+                check=True,
+            )
+            os.replace(processed_path, out_path)
+        finally:
+            if os.path.exists(processed_path):
+                _remove_with_retry(processed_path)
     if jump_cuts:
         jump_path = out_path + ".jump.mp4"
-        _remove_silent_video(out_path, jump_path)
-        os.replace(jump_path, out_path)
+        try:
+            _remove_silent_video(out_path, jump_path)
+            os.replace(jump_path, out_path)
+        finally:
+            if os.path.exists(jump_path):
+                _remove_with_retry(jump_path)
     if background_music or watermark:
         extra_path = out_path + ".extras.mp4"
-        ffmpeg = _find_ffmpeg()
-        inputs = [ffmpeg, "-y", "-loglevel", "error", "-i", out_path]
-        filters = []
-        maps = []
-        input_index = 1
-        if background_music:
-            if not os.path.isfile(background_music):
-                raise RuntimeError(f"background music file not found: {background_music}")
-            inputs += ["-stream_loop", "-1", "-i", background_music]
-            filters.append(f"[0:a][{input_index}:a]amix=inputs=2:duration=first:dropout_transition=2[a]")
-            maps.append("[a]")
-            input_index += 1
-        if watermark:
-            if not os.path.isfile(watermark):
-                raise RuntimeError(f"watermark image not found: {watermark}")
-            inputs += ["-i", watermark]
-            filters.append(f"[0:v][{input_index}:v]overlay=W-w-24:H-h-24[v]")
-            maps.insert(0, "[v]")
-        if background_music and not watermark:
-            maps.insert(0, "0:v:0")
-        if watermark and not background_music:
-            maps.append("0:a:0?")
-        cmd = inputs
-        if filters:
-            cmd += ["-filter_complex", ";".join(filters)]
-        if maps:
-            cmd += ["-map", maps[0]]
-            if len(maps) > 1:
-                cmd += ["-map", maps[1]]
-        else:
-            cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
-        cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-c:a", "aac", "-b:a", "128k", "-shortest", extra_path]
-        subprocess.run(cmd, check=True)
-        os.replace(extra_path, out_path)
+        try:
+            ffmpeg = _find_ffmpeg()
+            inputs = [ffmpeg, "-y", "-loglevel", "error", "-i", out_path]
+            filters = []
+            maps = []
+            input_index = 1
+            if background_music:
+                if not os.path.isfile(background_music):
+                    raise RuntimeError(f"background music file not found: {background_music}")
+                inputs += ["-stream_loop", "-1", "-i", background_music]
+                if _has_audio_stream(out_path):
+                    filters.append(f"[0:a][{input_index}:a]amix=inputs=2:duration=first:dropout_transition=2[a]")
+                else:
+                    # Some screen recordings contain video only. In that case
+                    # use the supplied music as the complete audio track.
+                    filters.append(f"[{input_index}:a]anull[a]")
+                maps.append("[a]")
+                input_index += 1
+            if watermark:
+                if not os.path.isfile(watermark):
+                    raise RuntimeError(f"watermark image not found: {watermark}")
+                inputs += ["-i", watermark]
+                filters.append(f"[0:v][{input_index}:v]overlay=W-w-24:H-h-24[v]")
+                maps.insert(0, "[v]")
+            if background_music and not watermark:
+                maps.insert(0, "0:v:0")
+            if watermark and not background_music:
+                maps.append("0:a:0?")
+            cmd = inputs
+            if filters:
+                cmd += ["-filter_complex", ";".join(filters)]
+            if maps:
+                cmd += ["-map", maps[0]]
+                if len(maps) > 1:
+                    cmd += ["-map", maps[1]]
+            else:
+                cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
+            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-c:a", "aac", "-b:a", "128k", "-shortest", extra_path]
+            subprocess.run(cmd, check=True)
+            os.replace(extra_path, out_path)
+        finally:
+            if os.path.exists(extra_path):
+                _remove_with_retry(extra_path)
     if intro or outro:
         segments = []
         for label, media in (("intro", intro), ("clip", out_path), ("outro", outro)):
@@ -603,14 +638,18 @@ def crop_clip_local(
             segments.append(media)
         if len(segments) > 1:
             branded = out_path + ".branded.mp4"
-            ffmpeg = _find_ffmpeg()
-            args = [ffmpeg, "-y", "-loglevel", "error"]
-            for media in segments:
-                args += ["-i", media]
-            concat = "".join(f"[{i}:v:0][{i}:a:0]" for i in range(len(segments)))
-            args += ["-filter_complex", f"{concat}concat=n={len(segments)}:v=1:a=1[v][a]", "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-c:a", "aac", "-b:a", "128k", branded]
-            subprocess.run(args, check=True)
-            os.replace(branded, out_path)
+            try:
+                ffmpeg = _find_ffmpeg()
+                args = [ffmpeg, "-y", "-loglevel", "error"]
+                for media in segments:
+                    args += ["-i", media]
+                concat = "".join(f"[{i}:v:0][{i}:a:0]" for i in range(len(segments)))
+                args += ["-filter_complex", f"{concat}concat=n={len(segments)}:v=1:a=1[v][a]", "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-c:a", "aac", "-b:a", "128k", branded]
+                subprocess.run(args, check=True)
+                os.replace(branded, out_path)
+            finally:
+                if os.path.exists(branded):
+                    _remove_with_retry(branded)
     return out_path
 
 

@@ -65,6 +65,11 @@ def _resolve_local_path(source: str) -> Optional[str]:
         raw_path = unquote(parsed.path)
         if parsed.netloc and parsed.netloc not in ("", "localhost"):
             raw_path = f"//{parsed.netloc}{raw_path}"
+        # RFC 8089 file URIs encode a Windows drive as ``file:///C:/...``.
+        # urlparse leaves the slash before the drive letter; remove it before
+        # constructing a native Windows path.
+        if os.name == "nt" and re.match(r"^/[A-Za-z]:", raw_path):
+            raw_path = raw_path[1:]
         candidate = Path(raw_path).expanduser()
         if candidate.exists() and candidate.is_file():
             return str(candidate.resolve())
@@ -144,6 +149,11 @@ def download_youtube_local(video_url: str, fmt: str = "720", out_dir: Optional[s
                     if os.path.exists(stem + ext):
                         path = stem + ext
                         break
+            if not os.path.isfile(path):
+                raise RuntimeError(
+                    "yt-dlp reported success, but the downloaded video file was not found. "
+                    f"Expected: {path}"
+                )
     except Exception as exc:
         message = str(exc)
         if "403" in message or "Forbidden" in message:
