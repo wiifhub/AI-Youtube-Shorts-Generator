@@ -3,7 +3,7 @@
 [![Powered by MuAPI](https://img.shields.io/badge/Powered%20by-MuAPI-6366f1?style=flat-square&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0xMiAyQzYuNDggMiAyIDYuNDggMiAxMnM0LjQ4IDEwIDEwIDEwIDEwLTQuNDggMTAtMTBTMTcuNTIgMiAxMiAyem0tMSAxNHYtNGgtMnYtMmg0djZoLTJ6bTAtOFY2aDJ2MmgtMnoiLz48L3N2Zz4=)](https://muapi.ai?utm_source=github&utm_medium=badge&utm_campaign=ai-youtube-shorts-generator)
 
 
-**The open-source alternative to Opus Clip, Vidyo.ai, Klap, SubMagic, 2short.ai, and other AI clipping tools.** Drop in any long-form YouTube video and get back ranked, viral-ready 9:16 shorts — for free, with no per-clip credits, no watermarks, and full control over the highlight algorithm.
+**The open-source alternative to Opus Clip, Vidyo.ai, Klap, SubMagic, 2short.ai, and other AI clipping tools.** Drop in any long-form YouTube video and get ranked, viral-ready 9:16 shorts locally or through an optional API. Local rendering has no built-in per-clip service limit; API and LLM provider charges follow their own terms.
 
 Built for creators, agencies, and developers who don't want to pay $20–$300/month or be capped on minutes processed. Uses GPT-class LLM highlight detection and Whisper transcription to extract the most viral-worthy moments and auto-crop them vertically for TikTok, Reels, and Shorts.
 
@@ -41,7 +41,7 @@ Built for creators, agencies, and developers who don't want to pay $20–$300/mo
 ## Features
 
 - **🎬 YouTube In, Vertical Out**: Hand it any YouTube URL — get back N viral-ready 9:16 mp4s
-- **🔀 Two Modes — API (fast) or Local (offline)**: Default `--mode api` uses MuAPI for download/transcription/cropping; `--mode local` runs entirely on your machine with `yt-dlp`, `faster-whisper`, and `ffmpeg`/`opencv`, and lets you pick OpenAI or Gemini for highlight ranking
+- **🔀 Two Modes — API (fast) or Local (offline)**: Default `--mode api` uses MuAPI for download/transcription/cropping; `--mode local` keeps download, transcription, and rendering on your machine with `yt-dlp`, `faster-whisper`, and `ffmpeg`/`opencv`, while the selected OpenAI or Gemini provider handles highlight ranking
 - **🤖 Virality-Aware Highlight Selection**: Clips ranked on hooks, emotional peaks, opinion bombs, revelation moments, conflict, quotable lines, story peaks, and practical value — not just generic "interesting"
 - **📈 Score + Hook + Reason for Every Clip**: Each highlight comes with a viral score, an opening hook line, and a one-sentence explanation of why it works
 - **🎤 Whisper Transcription, Your Choice**: Cloud (`/openai-whisper` via MuAPI) or local (`faster-whisper`, CPU or CUDA) — same downstream output shape
@@ -59,10 +59,10 @@ The local web application adds the complete creator workflow:
 - Drag-and-drop video uploads, local paths, batch URLs, persistent jobs, cancellation, and recent-job history.
 - Caption presets (Bold, Clean, Boxed, Karaoke) plus custom font, size, color, safe position, word timing, and filler-word cleanup.
 - Auto face framing toggle, manual crop position, crop-to-fill, zoom-out with blurred background, foreground zoom, and two-panel split layout.
-- Preview rendering, transcript timeline, sentence-boundary snapping, editable timestamps, per-clip regeneration, undo history, and ZIP export.
+- Preview rendering, transcript timeline, sentence-boundary snapping, editable timestamps, per-clip regeneration, one-step Undo, and ZIP export.
 - Silence trimming, real silent-video jump cuts, loudness normalization, noise reduction, background music, watermark, intro/outro, and automatic thumbnails.
 - Project presets for podcast/interview, educational, reaction/gaming, and story videos; generated titles, descriptions, hashtags, and platform publishing metadata.
-- Optional Save folder creates named job folders such as `20260910_214500_shorts_source_a1b2c3d4` containing source cache, transcript, clips, thumbnails, and metadata.
+- Optional Save folder creates named job folders such as `20260910_214500_shorts_source_a1b2c3d4` containing source cache, transcript, clips, thumbnails, `metadata.json`, and any preview media.
 - Whisper model/device controls (`tiny` through `large-v3`; Auto, CPU, or CUDA) with live CUDA status and safe CPU fallback.
 
 ### Web UI workspace (v0.6.0)
@@ -135,7 +135,7 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
 
 ### Web UI
 
-On Windows, from the downloaded/cloned project folder, double-click `install_windows.bat` once. It creates the virtual environment, installs all dependencies, and creates `.env` from `.env.example`. Then double-click `start_studio.bat` (or run `python -m web.app` inside the activated environment).
+On Windows, from the downloaded/cloned project folder, double-click `install_windows.bat` once. It creates the virtual environment, installs all dependencies, and creates `.env` from `.env.example`. Then double-click `start_studio.bat` (or run `python -m web.app` inside the activated environment). The app uses the current local source tree when started this way.
 
 ### Portable Windows executable
 
@@ -155,6 +155,12 @@ python -m web.app
 Open [http://127.0.0.1:7860](http://127.0.0.1:7860). Paste a YouTube URL, choose local or API mode, or drag in a video file. The UI supports caption presets (Bold, Clean, Boxed, Karaoke), highlight focus modes, silence/audio cleanup, batch sources, manual per-clip timestamp edits, and creator metadata. Jobs and results are saved under `output/jobs/`, so refreshing or reopening the UI keeps the recent-job history and playable local clips. Completed jobs can be downloaded as a ZIP containing local clips and `metadata.json`.
 
 ### GPU acceleration (Windows)
+
+> **Current defaults and costs:** API mode and the OpenAI/Gemini ranking step
+> use the credentials and billing terms of those providers. Local mode keeps
+> downloading, transcription, and rendering on this machine, while its chosen
+> LLM provider handles highlight ranking. MuAPI polling defaults to a 5-second
+> interval and a 600-second timeout.
 
 The web UI exposes Whisper model and device controls. `Auto` detects a usable CUDA device through CTranslate2 and otherwise falls back to CPU; `CPU` is the compatible fallback; `CUDA GPU` requires a current NVIDIA driver and a CUDA-capable CTranslate2 build. The portable release bundles the CTranslate2 runtime and reports the detected CUDA device in the status line. For source installs, run `install_gpu_windows.bat` if you also want the CUDA-enabled PyTorch diagnostics package; then restart Shorts Studio and choose **CUDA GPU**. The `requirements-gpu.txt` file documents that optional dependency.
 
@@ -331,10 +337,10 @@ Edit `shorts_generator/highlights.py`:
 - **Long-video threshold**: `LONG_VIDEO_THRESHOLD` (default 1800) — videos longer than this are chunked
 - **Chunk overlap**: `CHUNK_OVERLAP_SECONDS` (default 60) — overlap between chunks so cross-boundary clips aren't missed
 
-### Polling / timeout
+### Polling / timeout (current default timeout: 600 seconds)
 Edit `shorts_generator/config.py` (or set env vars):
 - `MUAPI_POLL_INTERVAL` (default 5s) — seconds between job-status polls
-- `MUAPI_POLL_TIMEOUT` (default 1800s) — give up after this long
+- `MUAPI_POLL_TIMEOUT` (default 600s) — give up after this long
 
 ### Whisper transcription
 Audio is transcribed by MuAPI's `/openai-whisper` endpoint (server-side `whisper-1`). Pass `--language <code>` to lock the recognition to a specific language; otherwise it auto-detects.
@@ -367,6 +373,7 @@ AI-Youtube-Shorts-Generator/
 ### Windows packaging files
 
 - `launcher.py` is the PyInstaller entry point for the portable executable.
+- `web/app.py` and `web/static/index.html` provide the Shorts Studio dashboard and editor workspace.
 - `install_windows.bat` creates a source-install virtual environment.
 - `install_gpu_windows.bat` adds optional CUDA-enabled PyTorch diagnostics for source installs.
 - `installer/ShortsStudio.iss` and `build_installer.bat` build the Inno Setup installer.
@@ -400,11 +407,11 @@ Project presets provide starting points for podcast/interview, educational, reac
 
 Use the web UI's optional **Save folder** field to choose a destination. Each job creates a timestamped subfolder containing the source cache, transcript, rendered shorts, thumbnails, and metadata.
 
-Clip edits can be previewed, regenerated, and reverted with the per-clip **Undo** action.
+Local clip edits can be previewed, regenerated, and reverted with the per-clip **Undo** action. API-mode clips can be regenerated through MuAPI, but local draft previews and Undo are not available for hosted-only media.
 
 Local renders also accept optional intro and outro MP4 paths, and can apply FFmpeg noise reduction alongside loudness normalization.
 
-The generated ZIP includes `metadata.json` plus platform-ready title, description, hashtag, and thumbnail-hook metadata for YouTube Shorts, TikTok, and Instagram Reels. Preview and regeneration use the same framing, captions, audio, and layout settings as the final render.
+The generated ZIP includes `metadata.json` plus platform-ready title, description, hashtag, and thumbnail-hook metadata for YouTube Shorts, TikTok, and Instagram Reels. Local preview and regeneration use the same framing, captions, audio, and layout settings as the final render.
 
 To close the standalone app, click **Quit Shorts Studio** in the web page. It stops the local server and leaves a clear closed confirmation page; closing the browser tab alone does not stop a manually launched server.
 

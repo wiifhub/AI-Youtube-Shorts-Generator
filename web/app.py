@@ -300,6 +300,27 @@ def _run_job(job_id: str, req: JobRequest) -> None:
             "transcript_duration": (result.get("transcript") or {}).get("duration"),
             "segment_count": len((result.get("transcript") or {}).get("segments") or []),
         }
+        # Keep a portable manifest beside the rendered media, including when
+        # the user selected a custom Save folder instead of output/jobs.
+        try:
+            with _lock:
+                job_state = _jobs[job_id]
+                created_at = job_state.get("created_at")
+                request_snapshot = dict(job_state.get("request") or {})
+            metadata = {
+                "job_id": job_id,
+                "created_at": created_at,
+                "output_dir": str(job_output_dir),
+                "request": request_snapshot,
+                "result": public,
+                "transcript": result.get("transcript") or {},
+            }
+            (job_output_dir / "metadata.json").write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            progress("metadata", f"Could not write metadata.json: {exc}")
         with _lock:
             job = _jobs[job_id]
             if job.get("status") == "cancelled":
