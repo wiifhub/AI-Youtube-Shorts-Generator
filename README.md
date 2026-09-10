@@ -65,6 +65,19 @@ The local web application adds the complete creator workflow:
 - Optional Save folder creates named job folders such as `20260910_214500_shorts_source_a1b2c3d4` containing source cache, transcript, clips, thumbnails, and metadata.
 - Whisper model/device controls (`tiny` through `large-v3`; Auto, CPU, or CUDA) with live CUDA status and safe CPU fallback.
 
+### Web UI workspace (v0.6.0)
+
+The reworked UI is organized as a small editing workspace instead of one long form:
+
+- **Dashboard** shows project counts, completion status, GPU availability, recent projects, and one-click resume.
+- **Workspace** keeps source setup, a large 9:16 preview, the inspector, transcript, timeline, rendered clips, and the render queue together.
+- **Timeline and transcript** expose sentence-aligned markers and clip boundaries so a clip can be selected, adjusted, previewed, regenerated, or undone without rerunning the whole source.
+- **Crop editor** provides per-clip Crop or Fit + blur framing, horizontal position, zoom, and optional face tracking. Changes are applied to the selected clip through the inspector or its clip card.
+- **Caption designer** provides preset styles, font, size, color, safe-area position, and live preview overlay controls.
+- **Render queue** keeps active and completed jobs visible, supports batch sources, cancellation, and persistent job history after a browser refresh.
+- **Export center** exposes metadata, language/model/device settings, ZIP export, and the saved job folder from one place.
+- **Responsive and accessible layout** adapts to narrow screens, keeps keyboard focus visible, labels controls for assistive technology, and honors reduced-motion preferences.
+
 ## Quick Start (No Setup)
 
 Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-clipping?utm_source=github&utm_medium=readme&utm_campaign=ai-youtube-shorts-generator) gives you the same Opus Clip–style pipeline as a single HTTP call — no Python, no dependencies, pay-per-clip instead of monthly subscriptions.
@@ -126,11 +139,11 @@ On Windows, from the downloaded/cloned project folder, double-click `install_win
 
 ### Portable Windows executable
 
-Download the current [ShortsStudio-v0.5.1-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.5.1/ShortsStudio-v0.5.1-windows.zip) and extract the entire ZIP. Open the `ShortsStudio` folder and double-click `ShortsStudio.exe`; it starts the local server and opens the browser automatically. Keep the whole folder together because it includes the runtime, CTranslate2, and FFmpeg binaries. Configure API keys in a `.env` file beside the executable when using local LLM ranking. Use **Quit Shorts Studio** in the page to stop the server cleanly.
+Download the current [ShortsStudio-v0.6.0-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.6.0/ShortsStudio-v0.6.0-windows.zip) and extract the entire ZIP. Open the `ShortsStudio` folder and double-click `ShortsStudio.exe`; it starts the local server and opens the browser automatically. Keep the whole folder together because it includes the runtime, CTranslate2, and FFmpeg binaries. Configure API keys in a `.env` file beside the executable when using local LLM ranking. Use **Quit Shorts Studio** in the page to stop the server cleanly.
 
 ### Installed Windows application
 
-For a normal Windows installation, download [ShortsStudio-Setup-v0.5.1.exe](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.5.1/ShortsStudio-Setup-v0.5.1.exe). The installer adds a Start Menu entry, offers a Desktop shortcut, installs the bundled runtime and FFmpeg, and registers an uninstaller. The app still runs locally at `http://127.0.0.1:7860`; no cloud account is required for the UI.
+For a normal Windows installation, download [ShortsStudio-Setup-v0.6.0.exe](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.6.0/ShortsStudio-Setup-v0.6.0.exe). The installer adds a Start Menu entry, offers a Desktop shortcut, installs the bundled runtime and FFmpeg, and registers an uninstaller. The app still runs locally at `http://127.0.0.1:7860`; no cloud account is required for the UI.
 
 For a source checkout, install dependencies, then:
 
