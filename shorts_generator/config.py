@@ -21,6 +21,20 @@ LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE", "auto")  # auto / cpu /
 LOCAL_OUTPUT_DIR = os.getenv("LOCAL_OUTPUT_DIR", "output")
 LOCAL_BURN_CAPTIONS = os.getenv("LOCAL_BURN_CAPTIONS", "true").strip().lower() == "true"
 
+
+def gpu_status() -> dict:
+    """Return safe CUDA availability details for the UI without importing Whisper."""
+    status = {"cuda_available": False, "device_name": None, "reason": "PyTorch not installed"}
+    try:
+        import torch  # type: ignore
+        if torch.cuda.is_available():
+            status.update(cuda_available=True, device_name=torch.cuda.get_device_name(0), reason="ready")
+        else:
+            status["reason"] = "CUDA runtime unavailable"
+    except Exception as exc:
+        status["reason"] = str(exc)
+    return status
+
 # VAD (Voice Activity Detection) settings for faster-whisper
 # Default threshold is 0.5; lower = more sensitive, higher = less sensitive
 # Default min_speech_duration_ms is 250ms; increase to avoid tiny false positives

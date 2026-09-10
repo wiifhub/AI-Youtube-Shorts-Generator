@@ -124,6 +124,14 @@ python -m web.app
 
 Open [http://127.0.0.1:7860](http://127.0.0.1:7860). Paste a YouTube URL, choose local or API mode, or drag in a video file. The UI supports caption presets (Bold, Clean, Boxed, Karaoke), highlight focus modes, silence/audio cleanup, batch sources, manual per-clip timestamp edits, and creator metadata. Jobs and results are saved under `output/jobs/`, so refreshing or reopening the UI keeps the recent-job history and playable local clips. Completed jobs can be downloaded as a ZIP containing local clips and `metadata.json`.
 
+### GPU acceleration (Windows)
+
+The web UI exposes Whisper model and device controls. `Auto` detects a usable CUDA device and otherwise falls back to CPU; `CPU` is the compatible fallback; `CUDA GPU` requires an NVIDIA driver, CUDA runtime, and a CUDA-enabled PyTorch install. After running `install_windows.bat`, run `install_gpu_windows.bat` to install the CUDA PyTorch wheel, restart Shorts Studio, and choose **CUDA GPU**. The status line at the top reports whether CUDA is available. The `requirements-gpu.txt` file documents the optional GPU dependency.
+
+### Professional Windows installer
+
+The Releases page includes both a portable ZIP and `ShortsStudio-Setup-vX.Y.Z.exe`. The setup program installs the bundled runtime and FFmpeg, creates Start Menu and optional Desktop shortcuts, and registers a normal Windows uninstaller. To build it yourself, build the portable app first, install Inno Setup 6, then run `build_installer.bat` (or `ISCC.exe installer\\ShortsStudio.iss`).
+
 ### Single video (API mode — default)
 
 ```bash

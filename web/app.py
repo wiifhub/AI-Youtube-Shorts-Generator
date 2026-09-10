@@ -41,6 +41,7 @@ from shorts_generator.config import (  # noqa: E402
     LOCAL_OUTPUT_DIR,
     LOCAL_WHISPER_DEVICE,
     LOCAL_WHISPER_MODEL,
+    gpu_status,
 )
 
 app = FastAPI(title="AI YouTube Shorts Generator", version="1.0")
@@ -135,6 +136,8 @@ class JobRequest(BaseModel):
     outro: Optional[str] = None
     jump_cuts: bool = False
     layout: str = "single"
+    whisper_model: Optional[str] = None
+    whisper_device: Optional[str] = None
     save_folder: Optional[str] = None
 
 
@@ -273,7 +276,8 @@ def _run_job(job_id: str, req: JobRequest) -> None:
             outro=req.outro,
             jump_cuts=req.jump_cuts,
             layout=req.layout,
-            save_folder=req.save_folder,
+            whisper_model=req.whisper_model,
+            whisper_device=req.whisper_device,
         )
         public = {
             "mode": result.get("mode"),
@@ -360,6 +364,8 @@ def _enqueue_job(req: JobRequest) -> Dict[str, Any]:
                 "outro": req.outro,
                 "jump_cuts": req.jump_cuts,
                 "layout": req.layout,
+                "whisper_model": req.whisper_model,
+                "whisper_device": req.whisper_device,
                 "save_folder": req.save_folder,
             },
         }
@@ -410,6 +416,9 @@ def create_batch_jobs(req: BatchRequest) -> Dict[str, Any]:
             outro=req.outro,
             jump_cuts=req.jump_cuts,
             layout=req.layout,
+            whisper_model=req.whisper_model,
+            whisper_device=req.whisper_device,
+            save_folder=req.save_folder,
         )
         jobs.append(_enqueue_job(item))
     if not jobs:
@@ -817,6 +826,9 @@ def system_status() -> Dict[str, Any]:
         "ffmpeg": bool(shutil.which("ffmpeg")),
         "whisper_model": LOCAL_WHISPER_MODEL,
         "whisper_device": LOCAL_WHISPER_DEVICE,
+        "gpu": gpu_status(),
+        "whisper_models": ["tiny", "base", "small", "medium", "large-v3"],
+        "whisper_devices": ["auto", "cpu", "cuda"],
         "captions_enabled": LOCAL_BURN_CAPTIONS,
         "free_disk_gb": round(usage.free / (1024 ** 3), 2),
         "max_concurrent_jobs": max(1, int(os.getenv("SHORTS_MAX_CONCURRENT_JOBS", "2"))),

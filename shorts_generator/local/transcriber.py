@@ -92,9 +92,23 @@ def _load_srt_cache(cache_path: Path) -> Dict:
     return {"duration": duration, "segments": segments}
 
 
-def _resolve_device() -> str:
-    if LOCAL_WHISPER_DEVICE != "auto":
-        return LOCAL_WHISPER_DEVICE
+def _resolve_device(requested: Optional[str] = None) -> str:
+    requested = (requested or LOCAL_WHISPER_DEVICE).lower()
+    if requested not in {"auto", "cpu", "cuda"}:
+        raise ValueError("Whisper device must be auto, cpu, or cuda")
+    if requested == "cuda":
+        try:
+            import torch  # type: ignore
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA was selected, but PyTorch cannot access an NVIDIA CUDA device")
+            torch.zeros(1, device="cuda")
+        except ImportError as exc:
+            raise RuntimeError("CUDA was selected, but PyTorch is not installed. Run install_gpu_windows.bat first") from exc
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError(f"CUDA was selected but is not usable: {exc}") from exc
+        return "cuda"
+    if requested != "auto":
+        return requested
     try:
         import torch  # type: ignore
         if torch.cuda.is_available():
@@ -110,6 +124,8 @@ def transcribe_local(
     media_path: str,
     language: Optional[str] = None,
     cache_dir: Optional[str] = None,
+    model_name: Optional[str] = None,
+    device: Optional[str] = None,
 ) -> Dict:
     """Run faster-whisper on a local file path, caching the result as .srt."""
     cache_path = _transcript_cache_path(media_path, cache_dir=cache_dir)
@@ -147,13 +163,14 @@ def transcribe_local(
             "    pip install -r requirements-local.txt"
         ) from e
 
-    device = _resolve_device()
-    compute_type = "float16" if device == "cuda" else "int8"
-    print(f"[transcribe/local] faster-whisper model={LOCAL_WHISPER_MODEL} device={device}", flush=True)
+    selected_device = _resolve_device(device)
+    selected_model = model_name or LOCAL_WHISPER_MODEL
+    compute_type = "float16" if selected_device == "cuda" else "int8"
+    print(f"[transcribe/local] faster-whisper model={selected_model} device={selected_device}", flush=True)
 
     from ..config import LOCAL_WHISPER_VAD_FILTER, LOCAL_WHISPER_VAD_PARAMETERS
 
-    model = WhisperModel(LOCAL_WHISPER_MODEL, device=device, compute_type=compute_type)
+    model = WhisperModel(selected_model, device=selected_device, compute_type=compute_type)
 
     transcribe_kwargs = {
         "audio": media_path,

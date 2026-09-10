@@ -198,6 +198,28 @@
           </div>
         </div>
         <div class="row">
+          <div>
+            <label>Whisper model</label>
+            <select name="whisper_model">
+              <option value="" selected>Configured default</option>
+              <option value="tiny">Tiny (fastest)</option>
+              <option value="base">Base (balanced)</option>
+              <option value="small">Small (more accurate)</option>
+              <option value="medium">Medium (high accuracy)</option>
+              <option value="large-v3">Large v3 (best accuracy)</option>
+            </select>
+          </div>
+          <div>
+            <label>Whisper device</label>
+            <select name="whisper_device">
+              <option value="" selected>Auto (recommended)</option>
+              <option value="cpu">CPU</option>
+              <option value="cuda">CUDA GPU</option>
+            </select>
+          </div>
+        </div>
+        <div class="caption-note">GPU acceleration uses CUDA when PyTorch and a compatible NVIDIA driver are installed. Auto safely falls back to CPU.</div>
+        <div class="row">
           <div><label>Intro clip (optional local path)</label><input name="intro" type="text" placeholder="C:\\Brand\\intro.mp4" /></div>
           <div><label>Outro clip (optional local path)</label><input name="outro" type="text" placeholder="C:\\Brand\\outro.mp4" /></div>
         </div>
@@ -637,7 +659,9 @@
       try {
         const response = await fetch("/api/system");
         const info = await response.json();
-        systemStatus.textContent = `${info.ffmpeg ? "ffmpeg ready" : "ffmpeg missing"} · Whisper ${info.whisper_model} (${info.whisper_device}) · ${info.free_disk_gb} GB free`;
+        const gpu = info.gpu || {};
+        const gpuText = gpu.cuda_available ? `CUDA ready${gpu.device_name ? ` (${gpu.device_name})` : ""}` : "CUDA unavailable";
+        systemStatus.textContent = `${info.ffmpeg ? "ffmpeg ready" : "ffmpeg missing"} · Whisper ${info.whisper_model} (${info.whisper_device}) · ${gpuText} · ${info.free_disk_gb} GB free`;
       } catch (err) {
         systemStatus.textContent = "Local tool status unavailable";
       }
@@ -666,6 +690,8 @@
       data.caption_font = String(data.caption_font || "Arial").trim();
       data.caption_size = Number(data.caption_size || 0);
       data.caption_color = data.caption_color || null;
+      data.whisper_model = String(data.whisper_model || "").trim() || null;
+      data.whisper_device = String(data.whisper_device || "").trim() || null;
       data.background_music = String(data.background_music || "").trim() || null;
       data.watermark = String(data.watermark || "").trim() || null;
       if (!data.language) delete data.language;

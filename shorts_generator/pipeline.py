@@ -51,6 +51,8 @@ def _run_local(
     outro: Optional[str] = None,
     jump_cuts: bool = False,
     layout: str = "single",
+    whisper_model: Optional[str] = None,
+    whisper_device: Optional[str] = None,
 ) -> Dict:
     from .local.clipper import crop_highlights_local
     from .local.downloader import download_youtube_local
@@ -77,6 +79,8 @@ def _run_local(
         source_path,
         language=language,
         cache_dir=output_dir,
+        model_name=whisper_model,
+        device=whisper_device,
     )
     transcript["visual_events"] = visual_events
     if not transcript["segments"]:
@@ -202,6 +206,8 @@ def generate_shorts(
     outro: Optional[str] = None,
     jump_cuts: bool = False,
     layout: str = "single",
+    whisper_model: Optional[str] = None,
+    whisper_device: Optional[str] = None,
 ) -> Dict:
     """Run the full pipeline and return a structured result.
 
@@ -267,6 +273,8 @@ def generate_shorts(
             outro,
             jump_cuts,
             layout,
+            whisper_model,
+            whisper_device,
         )
     if mode == "api":
         return _run_api(
