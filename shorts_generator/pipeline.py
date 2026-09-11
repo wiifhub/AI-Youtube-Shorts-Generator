@@ -11,7 +11,13 @@ from typing import Callable, Dict, List, Optional
 ProgressFn = Optional[Callable[[str, str], None]]
 
 from .clipper import crop_highlights
-from .config import LOCAL_BURN_CAPTIONS
+from .config import (
+    GEMINI_API_KEY,
+    LLM_PROVIDER,
+    LOCAL_BURN_CAPTIONS,
+    LOCAL_HEURISTIC_FALLBACK,
+    OPENAI_API_KEY,
+)
 from .downloader import download_youtube
 from .highlights import call_muapi_llm, get_highlights
 from .transcriber import transcribe
@@ -57,6 +63,7 @@ def _run_local(
     from .local.clipper import crop_highlights_local
     from .local.downloader import download_youtube_local
     from .local.llm import call_local_llm
+    from .local.fallback import rank_highlights_offline
     from .local.transcriber import transcribe_local
     from .local.visual import analyze_video
 
@@ -89,9 +96,23 @@ def _run_local(
         )
 
     _emit(progress, "rank", "Ranking viral highlights...")
-    highlights_result = get_highlights(
-        transcript, num_clips=num_clips, llm_fn=call_local_llm, focus=focus
+    provider = str(LLM_PROVIDER or "openai").strip().lower()
+    llm_configured = (provider == "openai" and bool(OPENAI_API_KEY)) or (
+        provider == "gemini" and bool(GEMINI_API_KEY)
     )
+    if LOCAL_HEURISTIC_FALLBACK and not llm_configured:
+        _emit(
+            progress,
+            "rank",
+            "No OpenAI/Gemini key configured; using offline transcript ranking.",
+        )
+        highlights_result = {
+            "highlights": rank_highlights_offline(transcript, num_clips=num_clips)
+        }
+    else:
+        highlights_result = get_highlights(
+            transcript, num_clips=num_clips, llm_fn=call_local_llm, focus=focus
+        )
     all_highlights: List[Dict] = highlights_result.get("highlights", [])
     if not all_highlights:
         raise RuntimeError("Highlight generator returned zero clips.")

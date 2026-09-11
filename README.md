@@ -90,7 +90,7 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
 
 - Python 3.10+
 - For **API mode (default)**: a MuAPI key — powers download, transcription, highlight ranking, and clipping in a single dependency
-- For **Local mode** (`--mode local`): `ffmpeg` on your PATH and an LLM API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`; local files stay on this machine, while remote URLs need yt-dlp network access and the highlight-ranking step uses the selected LLM)
+- For **Local mode** (`--mode local`): `ffmpeg` on your PATH; OpenAI/Gemini keys are optional (without one, deterministic offline transcript ranking is used). Local files stay on this machine, while remote URLs need yt-dlp network access.
 
 ### Steps
 
@@ -129,6 +129,7 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
    LOCAL_WHISPER_MODEL=base          # tiny / base / small / medium / large-v3
    LOCAL_WHISPER_DEVICE=auto         # auto / cpu / cuda
    LOCAL_OUTPUT_DIR=output           # where local mp4s land
+   LOCAL_HEURISTIC_FALLBACK=true     # rank offline when no LLM key is configured
    ```
 
 ## Usage
@@ -139,11 +140,11 @@ On Windows, from the downloaded/cloned project folder, double-click `install_win
 
 ### Portable Windows executable
 
-Download the current [ShortsStudio-v0.6.2-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.6.2/ShortsStudio-v0.6.2-windows.zip) and extract the entire ZIP. Open the `ShortsStudio` folder and double-click `unblock_and_start.bat`; it removes the download block from the extracted files and starts `ShortsStudio.exe`. You can also launch the executable directly after choosing **More info > Run anyway** once. Keep the whole folder together because it includes the runtime, CTranslate2, CUDA 12 runtime libraries, and FFmpeg binaries. Configure API keys in a `.env` file beside the executable when using local LLM ranking. Use **Quit Shorts Studio** in the page to stop the server cleanly.
+Download the current [ShortsStudio-v0.6.3-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.6.3/ShortsStudio-v0.6.3-windows.zip) and extract the entire ZIP. Open the `ShortsStudio` folder and double-click `unblock_and_start.bat`; it removes the download block from the extracted files and starts `ShortsStudio.exe`. You can also launch the executable directly after choosing **More info > Run anyway** once. Keep the whole folder together because it includes the runtime, CTranslate2, CUDA 12 runtime libraries, and FFmpeg binaries. Add a `.env` file beside the executable with OpenAI or Gemini credentials for AI ranking; otherwise Local mode automatically uses offline transcript ranking. Use **Quit Shorts Studio** in the page to stop the server cleanly.
 
 ### Installed Windows application
 
-For a normal Windows installation, download [ShortsStudio-Setup-v0.6.2.exe](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.6.2/ShortsStudio-Setup-v0.6.2.exe). The installer adds a Start Menu entry, offers a Desktop shortcut, installs the bundled runtime and FFmpeg, and registers an uninstaller. The app still runs locally at `http://127.0.0.1:7860`; no cloud account is required for the UI.
+For a normal Windows installation, download [ShortsStudio-Setup-v0.6.3.exe](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.6.3/ShortsStudio-Setup-v0.6.3.exe). The installer adds a Start Menu entry, offers a Desktop shortcut, installs the bundled runtime and FFmpeg, and registers an uninstaller. The app still runs locally at `http://127.0.0.1:7860`; no cloud account is required for the UI.
 
 For a source checkout, install dependencies, then:
 
@@ -162,7 +163,7 @@ Open [http://127.0.0.1:7860](http://127.0.0.1:7860). Paste a YouTube URL, choose
 > LLM provider handles highlight ranking. MuAPI polling defaults to a 5-second
 > interval and a 600-second timeout.
 
-The web UI exposes Whisper model and device controls. `Auto` detects a usable CUDA device through CTranslate2 and otherwise falls back to CPU; `CPU` is the compatible fallback; `CUDA GPU` requires a current NVIDIA driver and a CUDA-capable CTranslate2 build. The portable release bundles the CTranslate2 runtime and reports the detected CUDA device in the status line. For source installs, run `install_gpu_windows.bat` if you also want the CUDA-enabled PyTorch diagnostics package; then restart Shorts Studio and choose **CUDA GPU**. The `requirements-gpu.txt` file documents that optional dependency.
+The web UI exposes Whisper model and device controls. `Auto` detects a usable CUDA device through CTranslate2 and otherwise falls back to CPU; `CPU` is the compatible fallback; `CUDA GPU` requires a current NVIDIA driver and a CUDA-capable CTranslate2 build. The portable release bundles the CTranslate2 runtime and reports the detected CUDA device in the status line. For source installs, run `install_gpu_windows.bat` if you also want the CUDA-enabled PyTorch diagnostics package; then restart Shorts Studio and choose **CUDA GPU**. If no LLM credential is configured, Local mode remains usable through its deterministic offline transcript ranker. The `requirements-gpu.txt` file documents that optional dependency.
 
 ### Professional Windows installer
 

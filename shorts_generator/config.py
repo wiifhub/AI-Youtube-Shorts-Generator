@@ -33,6 +33,7 @@ LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "base").strip() or "base"
 LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE", "auto").strip().lower() or "auto"  # auto / cpu / cuda
 LOCAL_OUTPUT_DIR = os.getenv("LOCAL_OUTPUT_DIR", "output").strip() or "output"
 LOCAL_BURN_CAPTIONS = os.getenv("LOCAL_BURN_CAPTIONS", "true").strip().lower() == "true"
+LOCAL_HEURISTIC_FALLBACK = os.getenv("LOCAL_HEURISTIC_FALLBACK", "true").strip().lower() == "true"
 
 
 def gpu_status() -> dict:
