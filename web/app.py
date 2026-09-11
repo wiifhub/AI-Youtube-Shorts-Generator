@@ -114,6 +114,32 @@ def _dict_items(value: Any) -> List[Dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)]
 
 
+def _dict_value(value: Any) -> Dict[str, Any]:
+    """Return a shallow object copy, or an empty object for corrupt state."""
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _job_media_path(job: Dict[str, Any], value: Any) -> Optional[Path]:
+    """Resolve a generated media path without allowing persisted path escapes.
+
+    Custom save folders are supported, so the job's own ``output_dir`` is the
+    trust boundary rather than the global ``output/jobs`` directory.  A stale
+    or hand-edited job record must not turn the clip/thumbnail endpoints into
+    arbitrary file readers.
+    """
+    if not value or str(value).startswith("http"):
+        return None
+    try:
+        candidate = Path(str(value)).expanduser().resolve()
+        output_dir = Path(
+            str(job.get("output_dir") or (_jobs_dir / str(job.get("id") or "")))
+        ).expanduser().resolve()
+        candidate.relative_to(output_dir)
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return None
+    return candidate
+
+
 def _job_path(job_id: str) -> Path:
     safe_id = str(job_id)
     if not _job_id_pattern.fullmatch(safe_id):
@@ -295,6 +321,8 @@ def _public_shorts(shorts: List[Dict], job_id: str) -> List[Dict]:
 
 
 def _run_job(job_id: str, req: JobRequest) -> None:
+    slot_acquired = False
+
     def progress(stage: str, message: str) -> None:
         with _lock:
             job = _jobs[job_id]
@@ -307,6 +335,7 @@ def _run_job(job_id: str, req: JobRequest) -> None:
 
     try:
         _job_slots.acquire()
+        slot_acquired = True
         progress("queued", "Starting pipeline...")
         if req.save_folder:
             base = Path(req.save_folder).expanduser().resolve()
@@ -351,13 +380,18 @@ def _run_job(job_id: str, req: JobRequest) -> None:
             whisper_model=req.whisper_model,
             whisper_device=req.whisper_device,
         )
+        if not isinstance(result, dict):
+            raise RuntimeError("pipeline returned an invalid result object")
+        transcript = _dict_value(result.get("transcript"))
+        raw_shorts = _dict_items(result.get("shorts"))
+        highlights = _dict_items(result.get("highlights"))
         public = {
             "mode": result.get("mode"),
             "source_video_url": result.get("source_video_url"),
-            "highlights": result.get("highlights", []),
-            "shorts": _public_shorts(result.get("shorts", []), job_id),
-            "transcript_duration": (result.get("transcript") or {}).get("duration"),
-            "segment_count": len((result.get("transcript") or {}).get("segments") or []),
+            "highlights": highlights,
+            "shorts": _public_shorts(raw_shorts, job_id),
+            "transcript_duration": _safe_transcript_duration(transcript),
+            "segment_count": len(_dict_items(transcript.get("segments"))),
         }
         # Keep a portable manifest beside the rendered media, including when
         # the user selected a custom Save folder instead of output/jobs.
@@ -372,7 +406,7 @@ def _run_job(job_id: str, req: JobRequest) -> None:
                 "output_dir": str(job_output_dir),
                 "request": request_snapshot,
                 "result": public,
-                "transcript": result.get("transcript") or {},
+                "transcript": transcript,
             }
             (job_output_dir / "metadata.json").write_text(
                 json.dumps(metadata, ensure_ascii=False, indent=2, default=str),
@@ -388,8 +422,8 @@ def _run_job(job_id: str, req: JobRequest) -> None:
             job["stage"] = "done"
             job["message"] = f"Rendered {len(public['shorts'])} shorts"
             job["result"] = public
-            job["raw_shorts"] = result.get("shorts", [])
-            job["raw_transcript"] = result.get("transcript") or {}
+            job["raw_shorts"] = raw_shorts
+            job["raw_transcript"] = transcript
             job["raw_source_video_url"] = result.get("source_video_url")
             job["logs"].append({"t": time.time(), "stage": "done", "message": job["message"]})
             _persist_job_locked(job)
@@ -405,7 +439,10 @@ def _run_job(job_id: str, req: JobRequest) -> None:
             job["logs"].append({"t": time.time(), "stage": "error", "message": str(exc)})
             _persist_job_locked(job)
     finally:
-        _job_slots.release()
+        if slot_acquired:
+            _job_slots.release()
+        with _lock:
+            _cancel_events.pop(job_id, None)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -583,11 +620,11 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
         raw_shorts = _dict_items(job.get("raw_shorts"))
         if index < 0 or index >= len(raw_shorts):
             raise HTTPException(404, "clip not found")
-        request = dict(job.get("request") or {})
+        request = _dict_value(job.get("request"))
         transcript = job.get("raw_transcript")
         transcript = dict(transcript) if isinstance(transcript, dict) else {}
         source = job.get("raw_source_video_url")
-        mode = str((job.get("result") or {}).get("mode") or request.get("mode") or "local")
+        mode = str(_dict_value(job.get("result")).get("mode") or request.get("mode") or "local")
 
     duration = _safe_transcript_duration(transcript)
     if duration and update.start_time >= duration:
@@ -608,9 +645,12 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
             from shorts_generator.local.clipper import crop_clip_local
 
             old_path = str(old.get("clip_url") or "")
-            out_path = old_path if old_path and not old_path.startswith("http") else str(
-                _jobs_dir / job_id / f"short_{index + 1:02d}.mp4"
-            )
+            safe_old_path = _job_media_path(job, old_path)
+            if safe_old_path and safe_old_path.is_file():
+                out_path = str(safe_old_path)
+            else:
+                job_output_dir = str(job.get("output_dir") or (_jobs_dir / job_id))
+                out_path = str(Path(job_output_dir).expanduser().resolve() / f"short_{index + 1:02d}.mp4")
             undo_path = out_path + ".undo.mp4"
             render_path = out_path + ".regenerate.mp4"
             Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -674,7 +714,7 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
             try:
                 from shorts_generator.local.visual import extract_thumbnail
 
-                thumb = str(_jobs_dir / job_id / f"short_{index + 1:02d}.jpg")
+                thumb = str(Path(out_path).with_suffix(".jpg"))
                 extract_thumbnail(str(source), (update.start_time + update.end_time) / 2.0, thumb)
                 replacement["thumbnail_path"] = thumb
             except Exception:
@@ -723,7 +763,7 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
             raise HTTPException(409, "job clips changed while regenerating")
         current[index] = replacement
         job["raw_shorts"] = current
-        result = dict(job.get("result") or {})
+        result = _dict_value(job.get("result"))
         result["shorts"] = _public_shorts(current, job_id)
         job["result"] = result
         job["message"] = f"Regenerated clip {index + 1}"
@@ -742,19 +782,21 @@ def undo_clip(job_id: str, index: int) -> Dict[str, Any]:
         if index < 0 or index >= len(shorts):
             raise HTTPException(404, "clip not found")
         item = dict(shorts[index])
-        undo_path = str(item.get("undo_path") or "")
-        clip_path = str(item.get("clip_url") or "")
-        if not undo_path or not os.path.isfile(undo_path) or not clip_path:
+        undo_path = _job_media_path(job, item.get("undo_path"))
+        clip_path = _job_media_path(job, item.get("clip_url"))
+        if not undo_path or not undo_path.is_file() or not clip_path:
             raise HTTPException(400, "no previous clip version is available")
         shutil.copyfile(undo_path, clip_path)
-        restored = dict(item.get("undo_metadata") or item)
-        restored["clip_url"] = clip_path
+        restored = _dict_value(item.get("undo_metadata")) or dict(item)
+        restored["clip_url"] = str(clip_path)
         restored.pop("undo_path", None)
         restored.pop("undo_metadata", None)
         shorts[index] = restored
         job["raw_shorts"] = shorts
-        if job.get("result"):
-            job["result"]["shorts"] = _public_shorts(shorts, job_id)
+        result = _dict_value(job.get("result"))
+        if result:
+            result["shorts"] = _public_shorts(shorts, job_id)
+            job["result"] = result
         _persist_job_locked(job)
         return _job_snapshot(job)
 
@@ -782,9 +824,9 @@ def export_job(job_id: str):
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, "job not found")
-        result = dict(job.get("result") or {})
+        result = _dict_value(job.get("result"))
         raw_shorts = _dict_items(job.get("raw_shorts"))
-        request = dict(job.get("request") or {})
+        request = _dict_value(job.get("request"))
 
     manifest = {
         "job_id": job_id,
@@ -806,11 +848,11 @@ def export_job(job_id: str):
         bundle.writestr("publishing/tiktok.json", json.dumps({"platform": "tiktok", "items": [s["creator_metadata"] for s in manifest["shorts"]]}, ensure_ascii=False, indent=2))
         bundle.writestr("publishing/instagram_reels.json", json.dumps({"platform": "instagram_reels", "items": [s["creator_metadata"] for s in manifest["shorts"]]}, ensure_ascii=False, indent=2))
         for index, short in enumerate(raw_shorts, 1):
-            path = str(short.get("clip_url") or "")
-            if path and not path.startswith("http") and Path(path).is_file():
+            path = _job_media_path(job, short.get("clip_url"))
+            if path and path.is_file():
                 bundle.write(path, arcname=f"clips/short_{index:02d}.mp4")
-            thumbnail = str(short.get("thumbnail_path") or "")
-            if thumbnail and Path(thumbnail).is_file():
+            thumbnail = _job_media_path(job, short.get("thumbnail_path"))
+            if thumbnail and thumbnail.is_file():
                 bundle.write(thumbnail, arcname=f"thumbnails/short_{index:02d}.jpg")
     archive.seek(0)
     return StreamingResponse(
@@ -841,8 +883,8 @@ def get_clip(job_id: str, index: int):
     path = shorts[index].get("clip_url")
     if not path or str(path).startswith("http"):
         raise HTTPException(400, "clip is not a local file")
-    p = Path(path)
-    if not p.is_file():
+    p = _job_media_path(job, path)
+    if not p or not p.is_file():
         raise HTTPException(404, f"file missing: {path}")
     return FileResponse(p, media_type="video/mp4", filename=p.name)
 
@@ -854,7 +896,7 @@ def preview_clip(job_id: str, update: ClipUpdate) -> Dict[str, Any]:
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, "job not found")
-        request = dict(job.get("request") or {})
+        request = _dict_value(job.get("request"))
         source = job.get("raw_source_video_url")
         transcript = job.get("raw_transcript")
         transcript = dict(transcript) if isinstance(transcript, dict) else {}
@@ -933,9 +975,10 @@ def get_thumbnail(job_id: str, index: int):
     if index < 0 or index >= len(shorts):
         raise HTTPException(404, "thumbnail not found")
     path = shorts[index].get("thumbnail_path")
-    if not path or not Path(path).is_file():
+    safe_path = _job_media_path(job, path)
+    if not safe_path or not safe_path.is_file():
         raise HTTPException(404, "thumbnail not found")
-    return FileResponse(path, media_type="image/jpeg", filename=Path(path).name)
+    return FileResponse(safe_path, media_type="image/jpeg", filename=safe_path.name)
 
 
 @app.post("/api/uploads")
@@ -949,6 +992,9 @@ async def upload_video(file: UploadFile = File(...)) -> Dict[str, Any]:
 
     safe_stem = Path(original_name).stem.strip() or "video"
     safe_stem = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in safe_stem)
+    # Keep the final path comfortably below Windows MAX_PATH even when a
+    # browser supplies an unusually long filename.
+    safe_stem = safe_stem[:120] or "video"
     target = _uploads_dir / f"upload_{uuid.uuid4().hex[:12]}_{safe_stem}{suffix}"
     temporary = target.with_suffix(target.suffix + ".part")
     size = 0

@@ -251,9 +251,15 @@ def _write_ass_captions(
         try:
             start = float(segment.get("start", 0.0))
             end = float(segment.get("end", 0.0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
-        if end <= start or end <= clip_start or start >= clip_end:
+        if (
+            not math.isfinite(start)
+            or not math.isfinite(end)
+            or end <= start
+            or end <= clip_start
+            or start >= clip_end
+        ):
             continue
         text = _escape_ass_text(
             segment.get("text", ""), remove_filler_words=remove_filler_words
@@ -273,9 +279,14 @@ def _write_ass_captions(
                     word_text = _escape_ass_text(
                         word.get("word", ""), remove_filler_words=remove_filler_words
                     )
-                except (KeyError, TypeError, ValueError):
+                except (KeyError, TypeError, ValueError, OverflowError):
                     continue
-                if word_end > word_start and word_text:
+                if (
+                    math.isfinite(word_start)
+                    and math.isfinite(word_end)
+                    and word_end > word_start
+                    and word_text
+                ):
                     timed_words.append((word_start, word_end, word_text))
             if not timed_words:
                 plain_words = " ".join(text.split(r"\N")).split()

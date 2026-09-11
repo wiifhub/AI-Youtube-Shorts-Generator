@@ -65,7 +65,7 @@ The local web application adds the complete creator workflow:
 - Optional Save folder creates named job folders such as `20260910_214500_shorts_source_a1b2c3d4` containing source cache, transcript, clips, thumbnails, `metadata.json`, and any preview media.
 - Whisper model/device controls (`tiny` through `large-v3`; Auto, CPU, or CUDA) with live CUDA status and safe CPU fallback.
 
-### Web UI workspace (v0.6.0)
+### Web UI workspace
 
 The reworked UI is organized as a small editing workspace instead of one long form:
 
@@ -90,7 +90,7 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
 
 - Python 3.10+
 - For **API mode (default)**: a MuAPI key — powers download, transcription, highlight ranking, and clipping in a single dependency
-- For **Local mode** (`--mode local`): `ffmpeg` on your PATH and an LLM API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`; only the LLM step is remote)
+- For **Local mode** (`--mode local`): `ffmpeg` on your PATH and an LLM API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`; local files stay on this machine, while remote URLs need yt-dlp network access and the highlight-ranking step uses the selected LLM)
 
 ### Steps
 
@@ -178,13 +178,13 @@ The portable executable and installer are not digitally signed in this repositor
 python main.py "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
-### Single video (Local mode — runs offline except for the LLM call)
+### Single video (Local mode)
 
 ```bash
 python main.py "https://www.youtube.com/watch?v=VIDEO_ID" --mode local
 ```
 
-Local mode writes the rendered shorts to `./output/short_01.mp4`, `short_02.mp4`, … (override with `LOCAL_OUTPUT_DIR`). The web UI uses an isolated `output/jobs/<job-id>/` directory per run. When transcript segments are available, local clips include burned-in captions generated through ffmpeg/libass; set `LOCAL_BURN_CAPTIONS=false` to disable them.
+Local mode writes the rendered shorts to `./output/short_01.mp4`, `short_02.mp4`, … (override with `LOCAL_OUTPUT_DIR`). The web UI uses an isolated `output/jobs/<job-id>/` directory per run, or a timestamped subfolder beneath the optional Save folder. Local files stay on this machine; remote URLs require yt-dlp network access, and highlight ranking uses the selected LLM. When transcript segments are available, local clips include burned-in captions generated through ffmpeg/libass; set `LOCAL_BURN_CAPTIONS=false` to disable them.
 
 ### With options
 

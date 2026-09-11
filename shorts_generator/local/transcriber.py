@@ -20,12 +20,12 @@ def _cuda_ready() -> bool:
         if torch.cuda.is_available():
             torch.zeros(1, device="cuda")
             return True
-    except (ImportError, OSError, RuntimeError):
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
         pass
     try:
         import ctranslate2  # type: ignore
         return int(ctranslate2.get_cuda_device_count()) > 0
-    except (ImportError, OSError, RuntimeError):
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
         return False
 
 
@@ -238,7 +238,7 @@ def transcribe_local(
             continue
         if not math.isfinite(segment_start) or not math.isfinite(segment_end) or segment_end <= segment_start:
             continue
-        text = (s.text or "").strip()
+        text = str(getattr(s, "text", "") or "").strip()
         if not text:
             continue
         segment = {
@@ -247,7 +247,9 @@ def transcribe_local(
             "text": text,
         }
         words = []
-        for word in getattr(s, "words", None) or []:
+        raw_words = getattr(s, "words", None)
+        word_items = raw_words if isinstance(raw_words, (list, tuple)) else []
+        for word in word_items:
             if getattr(word, "start", None) is None or getattr(word, "end", None) is None:
                 continue
             try:
