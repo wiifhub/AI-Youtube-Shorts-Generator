@@ -7,7 +7,7 @@
 
 **The open-source alternative to Opus Clip, Vidyo.ai, Klap, SubMagic, 2short.ai, and other AI clipping tools.** Drop in any long-form YouTube video and get ranked, viral-ready 9:16 shorts locally or through an optional API. Local rendering has no built-in per-clip service limit; API and LLM provider charges follow their own terms.
 
-**Current release: [Shorts Studio v0.7.1](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/tag/v0.7.1).** It adds a browser-free native desktop window, first-run diagnostics, recoverable project management, cached previews and waveforms, resumable jobs, caption-file exports, safer Windows packaging, and the original Shorts Studio cut-ribbon logo.
+**Current release: [Shorts Studio v0.7.2](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/tag/v0.7.2).** It adds a browser-free native desktop window, first-run diagnostics, recoverable project management, cached previews and waveforms, resumable jobs, caption-file exports, safer Windows packaging, the original Shorts Studio cut-ribbon logo, and explicit icon paths for reliable Windows shortcuts.
 
 Built for creators, agencies, and developers who don't want to pay $20–$300/month or be capped on minutes processed. Uses GPT-class LLM highlight detection and Whisper transcription to extract the most viral-worthy moments and auto-crop them vertically for TikTok, Reels, and Shorts.
 
@@ -156,11 +156,11 @@ The native launcher keeps a single instance per Windows user, chooses another lo
 
 ### Portable Windows executable
 
-Download the current [ShortsStudio-v0.7.1-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.7.1/ShortsStudio-v0.7.1-windows.zip) and extract the entire ZIP. Open the `ShortsStudio` folder and double-click `unblock_and_start.bat`; it removes the download block from the extracted files and starts `ShortsStudio.exe` in its native window. You can also launch the executable directly after choosing **More info > Run anyway** once. Keep the whole folder together because it includes the runtime, WebView2 shell dependencies, CTranslate2, optional CUDA 12 runtime libraries, and FFmpeg binaries. Add a `.env` file beside the executable with OpenAI or Gemini credentials for AI ranking; otherwise Local mode automatically uses offline transcript ranking. Use **Quit** in the page or tray to stop the server cleanly.
+Download the current [ShortsStudio-v0.7.2-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.7.2/ShortsStudio-v0.7.2-windows.zip) and extract the entire ZIP. Open the `ShortsStudio` folder and double-click `unblock_and_start.bat`; it removes the download block from the extracted files and starts `ShortsStudio.exe` in its native window. You can also launch the executable directly after choosing **More info > Run anyway** once. Keep the whole folder together because it includes the runtime, WebView2 shell dependencies, CTranslate2, optional CUDA 12 runtime libraries, FFmpeg binaries, and the branded shortcut icon. Add a `.env` file beside the executable with OpenAI or Gemini credentials for AI ranking; otherwise Local mode automatically uses offline transcript ranking. Use **Quit** in the page or tray to stop the server cleanly.
 
 ### Installed Windows application
 
-For a normal Windows installation, download [ShortsStudio-Setup-v0.7.1.exe](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.7.1/ShortsStudio-Setup-v0.7.1.exe). The installer adds a Start Menu entry, offers a Desktop shortcut, installs the bundled runtime and FFmpeg, and registers a normal uninstaller. The app runs locally in its native window; no cloud account is required for the UI. If the preferred port is already in use, the launcher selects another loopback port automatically.
+For a normal Windows installation, download [ShortsStudio-Setup-v0.7.2.exe](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.7.2/ShortsStudio-Setup-v0.7.2.exe). The installer adds a Start Menu entry, offers a Desktop shortcut with the branded icon, installs the bundled runtime and FFmpeg, and registers a normal uninstaller. The app runs locally in its native window; no cloud account is required for the UI. If the preferred port is already in use, the launcher selects another loopback port automatically.
 
 For a source checkout, install dependencies, then:
 
