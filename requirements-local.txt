@@ -6,5 +6,8 @@ faster-whisper>=1.0.0
 openai>=1.0.0
 google-genai>=1.0.0
 opencv-python>=4.8.0
+pywebview>=5.3
+pystray>=0.19
+Pillow>=10.0
 # torch is only needed if you want CUDA Whisper. CPU works without it.
 # torch>=2.0

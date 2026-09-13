@@ -6,11 +6,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import io
 import math
 import os
 import re
 import shutil
+import subprocess
+from array import array
 import sys
 import threading
 import time
@@ -26,7 +29,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from fastapi import File, FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -38,10 +41,15 @@ if str(ROOT) not in sys.path:
 
 from shorts_generator import generate_shorts  # noqa: E402
 from shorts_generator.config import (  # noqa: E402
+    GEMINI_API_KEY,
+    LLM_PROVIDER,
     LOCAL_BURN_CAPTIONS,
+    LOCAL_HEURISTIC_FALLBACK,
     LOCAL_OUTPUT_DIR,
     LOCAL_WHISPER_DEVICE,
     LOCAL_WHISPER_MODEL,
+    MUAPI_API_KEY,
+    OPENAI_API_KEY,
     gpu_status,
 )
 
@@ -68,6 +76,8 @@ _job_slots = threading.Semaphore(_max_concurrent_jobs)
 _output_root = Path(LOCAL_OUTPUT_DIR).expanduser().resolve()
 _jobs_dir = _output_root / "jobs"
 _uploads_dir = _output_root / "uploads"
+_trash_dir = _output_root / ".trash"
+_setup_state_path = _output_root / "studio_state.json"
 _allowed_upload_extensions = {
     ".avi",
     ".m4v",
@@ -80,6 +90,18 @@ _allowed_upload_extensions = {
 }
 _max_upload_mb = _positive_int_env("SHORTS_MAX_UPLOAD_MB", 2048)
 _max_upload_bytes = _max_upload_mb * 1024 * 1024
+_auto_resume = os.getenv("SHORTS_AUTO_RESUME", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _nonnegative_float_env(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return value if math.isfinite(value) and value >= 0 else default
+
+
+_min_free_gb = _nonnegative_float_env("SHORTS_MIN_FREE_GB", 0.5)
 
 
 def _safe_transcript_duration(transcript: Any) -> float:
@@ -150,6 +172,7 @@ def _job_path(job_id: str) -> Path:
 def _persist_job_locked(job: Dict[str, Any]) -> None:
     """Atomically persist one job; callers must hold ``_lock``."""
     _jobs_dir.mkdir(parents=True, exist_ok=True)
+    job["updated_at"] = time.time()
     path = _job_path(str(job["id"]))
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(
@@ -191,14 +214,18 @@ def _load_persisted_jobs() -> None:
         job.setdefault("status", "error")
         job.setdefault("stage", "unknown")
         job.setdefault("message", "Recovered project")
+        persisted_request = job.get("request") if isinstance(job.get("request"), dict) else {}
+        job.setdefault("name", str(persisted_request.get("url") or job_id))
+        job.setdefault("archived", False)
+        job.setdefault("updated_at", job.get("created_at"))
         if job.get("status") == "running":
-            message = "Interrupted when Shorts Studio stopped; start a new job to retry."
-            job["status"] = "error"
-            job["stage"] = "error"
+            message = "Interrupted when Shorts Studio stopped; it can be resumed."
+            job["status"] = "interrupted"
+            job["stage"] = "interrupted"
             job["message"] = message
-            job["error"] = message
+            job["error"] = None
             job["logs"] = list(job["logs"])[-79:]
-            job["logs"].append({"t": time.time(), "stage": "error", "message": message})
+            job["logs"].append({"t": time.time(), "stage": "interrupted", "message": message})
         _jobs[job_id] = job
 
 
@@ -235,6 +262,7 @@ class JobRequest(BaseModel):
     layout: str = "single"
     whisper_model: Optional[str] = None
     whisper_device: Optional[str] = None
+    output_height: int = Field(1920, ge=0, le=4320)
     save_folder: Optional[str] = None
 
 
@@ -256,25 +284,51 @@ class ClipUpdate(BaseModel):
     zoom: float = Field(1.0, ge=0.5, le=1.5)
     fit_mode: str = "crop"
     layout: str = "single"
+    output_height: int = Field(1920, ge=0, le=4320)
 
 
 class ProjectUpdate(BaseModel):
     name: str = Field(..., min_length=1, max_length=80)
 
 
+class OpenFolderRequest(BaseModel):
+    job_id: Optional[str] = None
+
+
+class SetupStateUpdate(BaseModel):
+    dismissed: bool = True
+
+
 def _job_snapshot(job: Dict[str, Any]) -> Dict[str, Any]:
+    status = str(job.get("status") or "unknown")
+    request = job.get("request") if isinstance(job.get("request"), dict) else {}
     return {
         "id": str(job.get("id") or ""),
-        "status": str(job.get("status") or "unknown"),
+        "status": status,
         "stage": str(job.get("stage") or "unknown"),
         "message": str(job.get("message") or ""),
         "logs": (job.get("logs") if isinstance(job.get("logs"), list) else [])[-80:],
         "error": job.get("error"),
         "result": job.get("result"),
         "created_at": job.get("created_at"),
-        "request": job.get("request") if isinstance(job.get("request"), dict) else {},
+        "updated_at": job.get("updated_at", job.get("created_at")),
+        "name": str(job.get("name") or request.get("url") or job.get("id") or "Untitled project"),
+        "archived": bool(job.get("archived", False)),
+        "can_retry": status in {"error", "cancelled", "interrupted", "draft"} and bool(request.get("url")),
+        "request": request,
         "output_dir": job.get("output_dir"),
     }
+
+
+def _append_job_log(job: Dict[str, Any], stage: str, message: Any) -> None:
+    """Append a bounded log entry even when an older job record is malformed."""
+    logs = job.get("logs")
+    if not isinstance(logs, list):
+        logs = []
+        job["logs"] = logs
+    logs.append({"t": time.time(), "stage": str(stage or "info"), "message": str(message or "")})
+    if len(logs) > 80:
+        del logs[:-80]
 
 
 def _creator_metadata(short: Dict[str, Any]) -> Dict[str, str]:
@@ -320,6 +374,36 @@ def _public_shorts(shorts: List[Dict], job_id: str) -> List[Dict]:
     return out
 
 
+def _cleanup_job_temporary_files(job: Dict[str, Any]) -> None:
+    """Remove only renderer scratch files, never completed/user media."""
+    output_dir = job.get("output_dir")
+    if not output_dir:
+        return
+    try:
+        root = Path(str(output_dir)).expanduser().resolve()
+        if not root.is_dir():
+            return
+        scratch_suffixes = (
+            ".part", ".cut.mp4", ".base.mp4", ".render.mp4", ".audio.mp4",
+            ".jump.mp4", ".extras.mp4", ".branded.mp4", ".silent.mp4",
+            ".regenerate.mp4",
+        )
+        for item in root.rglob("*"):
+            if not item.is_file() or not item.name.endswith(scratch_suffixes):
+                continue
+            try:
+                item.unlink()
+            except OSError:
+                continue
+    except (OSError, RuntimeError, TypeError):
+        return
+
+
+def _start_job_thread(job_id: str, req: JobRequest) -> None:
+    thread = threading.Thread(target=_run_job, args=(job_id, req), daemon=True)
+    thread.start()
+
+
 def _run_job(job_id: str, req: JobRequest) -> None:
     slot_acquired = False
 
@@ -330,7 +414,7 @@ def _run_job(job_id: str, req: JobRequest) -> None:
                 raise RuntimeError("Job cancelled")
             job["stage"] = stage
             job["message"] = message
-            job["logs"].append({"t": time.time(), "stage": stage, "message": message})
+            _append_job_log(job, stage, message)
             _persist_job_locked(job)
 
     try:
@@ -379,6 +463,7 @@ def _run_job(job_id: str, req: JobRequest) -> None:
             layout=req.layout,
             whisper_model=req.whisper_model,
             whisper_device=req.whisper_device,
+            output_height=req.output_height,
         )
         if not isinstance(result, dict):
             raise RuntimeError("pipeline returned an invalid result object")
@@ -417,6 +502,7 @@ def _run_job(job_id: str, req: JobRequest) -> None:
         with _lock:
             job = _jobs[job_id]
             if job.get("status") == "cancelled":
+                _cleanup_job_temporary_files(job)
                 return
             job["status"] = "done"
             job["stage"] = "done"
@@ -425,19 +511,23 @@ def _run_job(job_id: str, req: JobRequest) -> None:
             job["raw_shorts"] = raw_shorts
             job["raw_transcript"] = transcript
             job["raw_source_video_url"] = result.get("source_video_url")
-            job["logs"].append({"t": time.time(), "stage": "done", "message": job["message"]})
+            _append_job_log(job, "done", job["message"])
             _persist_job_locked(job)
     except Exception as exc:
         with _lock:
-            job = _jobs[job_id]
+            job = _jobs.get(job_id)
+            if not job:
+                return
             if job.get("status") == "cancelled":
+                _cleanup_job_temporary_files(job)
                 return
             job["status"] = "error"
             job["stage"] = "error"
             job["message"] = str(exc)
             job["error"] = str(exc)
-            job["logs"].append({"t": time.time(), "stage": "error", "message": str(exc)})
+            _append_job_log(job, "error", str(exc))
             _persist_job_locked(job)
+            _cleanup_job_temporary_files(job)
     finally:
         if slot_acquired:
             _job_slots.release()
@@ -455,10 +545,19 @@ def _enqueue_job(req: JobRequest) -> Dict[str, Any]:
         raise HTTPException(400, "mode must be api or local")
     if not req.url or not req.url.strip():
         raise HTTPException(400, "url/path cannot be blank")
+    try:
+        free_gb = shutil.disk_usage(_output_root).free / (1024 ** 3)
+    except OSError:
+        free_gb = 0.0
+    if _min_free_gb and free_gb < _min_free_gb:
+        raise HTTPException(507, f"not enough free disk space ({free_gb:.2f} GB available; {_min_free_gb:.2f} GB required)")
     job_id = uuid.uuid4().hex[:12]
+    default_name = re.sub(r"[^A-Za-z0-9 _-]+", " ", req.url.rsplit("/", 1)[-1]).strip()
+    default_name = " ".join(default_name.split())[:80] or "Untitled project"
     with _lock:
         _jobs[job_id] = {
             "id": job_id,
+            "name": default_name,
             "status": "running",
             "stage": "queued",
             "message": "Queued",
@@ -469,6 +568,8 @@ def _enqueue_job(req: JobRequest) -> Dict[str, Any]:
             "raw_transcript": {},
             "raw_source_video_url": None,
             "created_at": time.time(),
+            "updated_at": time.time(),
+            "archived": False,
             "request": {
                 "url": req.url.strip(),
                 "mode": req.mode,
@@ -498,15 +599,51 @@ def _enqueue_job(req: JobRequest) -> Dict[str, Any]:
                 "layout": req.layout,
                 "whisper_model": req.whisper_model,
                 "whisper_device": req.whisper_device,
+                "output_height": req.output_height,
                 "save_folder": req.save_folder,
             },
         }
         _cancel_events[job_id] = threading.Event()
         _persist_job_locked(_jobs[job_id])
-    thread = threading.Thread(target=_run_job, args=(job_id, req), daemon=True)
-    thread.start()
+    _start_job_thread(job_id, req)
     with _lock:
         return _job_snapshot(_jobs[job_id])
+
+
+def _resume_interrupted_jobs() -> None:
+    pending: List[tuple[str, JobRequest]] = []
+    with _lock:
+        for job_id, job in list(_jobs.items()):
+            if job.get("status") != "interrupted":
+                continue
+            request = _dict_value(job.get("request"))
+            try:
+                req = JobRequest.model_validate(request)
+            except Exception as exc:
+                job["status"] = "error"
+                job["stage"] = "error"
+                job["message"] = f"Saved project settings are invalid: {exc}"
+                job["error"] = job["message"]
+                _append_job_log(job, "error", job["message"])
+                _persist_job_locked(job)
+                continue
+            job["status"] = "running"
+            job["stage"] = "queued"
+            job["message"] = "Resuming after the previous Shorts Studio session."
+            job["error"] = None
+            job["logs"] = list(job.get("logs") or [])[-79:]
+            _append_job_log(job, "queued", job["message"])
+            _cancel_events[job_id] = threading.Event()
+            _persist_job_locked(job)
+            pending.append((job_id, req))
+    for job_id, req in pending:
+        _start_job_thread(job_id, req)
+
+
+@app.on_event("startup")
+async def resume_interrupted_jobs() -> None:
+    if _auto_resume:
+        threading.Thread(target=_resume_interrupted_jobs, name="shorts-studio-resume", daemon=True).start()
 
 
 @app.post("/api/jobs")
@@ -550,6 +687,7 @@ def create_batch_jobs(req: BatchRequest) -> Dict[str, Any]:
             layout=req.layout,
             whisper_model=req.whisper_model,
             whisper_device=req.whisper_device,
+            output_height=req.output_height,
             save_folder=req.save_folder,
         )
         jobs.append(_enqueue_job(item))
@@ -569,14 +707,14 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
             job["stage"] = "cancelled"
             job["message"] = "Cancellation requested"
             job["error"] = "Cancelled by user"
-            job["logs"].append({"t": time.time(), "stage": "cancelled", "message": job["message"]})
+            _append_job_log(job, "cancelled", job["message"])
             _cancel_events.setdefault(job_id, threading.Event()).set()
             _persist_job_locked(job)
         return _job_snapshot(job)
 
 
 @app.get("/api/jobs")
-def list_jobs() -> Dict[str, Any]:
+def list_jobs(include_archived: bool = False) -> Dict[str, Any]:
     def created_at_value(job: Dict[str, Any]) -> float:
         try:
             value = float(job.get("created_at") or 0.0)
@@ -588,7 +726,7 @@ def list_jobs() -> Dict[str, Any]:
         jobs = [
             _job_snapshot(j)
             for j in sorted(
-                _jobs.values(),
+                (j for j in _jobs.values() if include_archived or not j.get("archived", False)),
                 key=created_at_value,
                 reverse=True,
             )
@@ -608,6 +746,195 @@ def rename_job(job_id: str, update: ProjectUpdate) -> Dict[str, Any]:
         job["name"] = name
         _persist_job_locked(job)
         return _job_snapshot(job)
+
+
+@app.post("/api/jobs/{job_id}/archive")
+def archive_job(job_id: str) -> Dict[str, Any]:
+    """Toggle archive state without touching rendered media."""
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "job not found")
+        job["archived"] = not bool(job.get("archived", False))
+        _append_job_log(job, "project", "Archived" if job["archived"] else "Restored to library")
+        _persist_job_locked(job)
+        return _job_snapshot(job)
+
+
+@app.post("/api/jobs/{job_id}/duplicate")
+def duplicate_job(job_id: str) -> Dict[str, Any]:
+    """Create a clean draft with the source settings of an existing project."""
+    with _lock:
+        source = _jobs.get(job_id)
+        if not source:
+            raise HTTPException(404, "job not found")
+        request = _dict_value(source.get("request"))
+    try:
+        copied_request = JobRequest.model_validate(request)
+    except Exception as exc:
+        raise HTTPException(400, f"project settings are invalid: {exc}") from exc
+    new_id = uuid.uuid4().hex[:12]
+    name = f"{source.get('name') or 'Untitled project'} copy"
+    clone = {
+        "id": new_id,
+        "name": name[:80],
+        "status": "draft",
+        "stage": "draft",
+        "message": "Duplicated project ready to run",
+        "error": None,
+        "result": None,
+        "raw_shorts": [],
+        "raw_transcript": {},
+        "raw_source_video_url": None,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "archived": False,
+        "logs": [{"t": time.time(), "stage": "project", "message": "Duplicated from project " + job_id}],
+        "request": copied_request.model_dump(),
+    }
+    with _lock:
+        _jobs[new_id] = clone
+        _cancel_events.pop(new_id, None)
+        _persist_job_locked(clone)
+        return _job_snapshot(clone)
+
+
+def _trash_path(job_id: str) -> Path:
+    if not _job_id_pattern.fullmatch(str(job_id)):
+        raise ValueError("invalid job id")
+    return _trash_dir / f"{job_id}.json"
+
+
+@app.delete("/api/jobs/{job_id}")
+def delete_job(job_id: str) -> Dict[str, Any]:
+    """Soft-delete a project record; media remains recoverable on disk."""
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "job not found")
+        if job.get("status") == "running":
+            raise HTTPException(409, "cancel the running job before deleting it")
+        _trash_dir.mkdir(parents=True, exist_ok=True)
+        source = _job_path(job_id)
+        target = _trash_path(job_id)
+        if source.is_file():
+            os.replace(source, target)
+        else:
+            target.write_text(json.dumps(job, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        _jobs.pop(job_id, None)
+        _cancel_events.pop(job_id, None)
+    return {"status": "deleted", "job_id": job_id, "recoverable": True, "media_preserved": True}
+
+
+@app.post("/api/jobs/{job_id}/restore")
+def restore_job(job_id: str) -> Dict[str, Any]:
+    with _lock:
+        if job_id in _jobs:
+            raise HTTPException(409, "project is already in the library")
+        path = _trash_path(job_id)
+        if not path.is_file():
+            raise HTTPException(404, "deleted project not found")
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise HTTPException(500, f"could not restore project: {exc}") from exc
+        if not isinstance(job, dict) or str(job.get("id")) != job_id:
+            raise HTTPException(400, "deleted project record is invalid")
+        _jobs[job_id] = job
+        _persist_job_locked(job)
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return _job_snapshot(job)
+
+
+@app.post("/api/jobs/{job_id}/retry")
+def retry_job(job_id: str) -> Dict[str, Any]:
+    """Restart a failed/interrupted/draft project with its saved settings."""
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "job not found")
+        status = str(job.get("status") or "unknown")
+        if status == "running":
+            raise HTTPException(409, "project is already running")
+        if status not in {"error", "cancelled", "interrupted", "draft"}:
+            raise HTTPException(409, "only failed, cancelled, interrupted, or draft projects can be retried")
+        request = _dict_value(job.get("request"))
+    try:
+        req = JobRequest.model_validate(request)
+    except Exception as exc:
+        raise HTTPException(400, f"saved project settings are invalid: {exc}") from exc
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "job not found")
+        job["status"] = "running"
+        job["stage"] = "queued"
+        job["message"] = "Queued for retry"
+        job["error"] = None
+        job["result"] = None
+        job["raw_shorts"] = []
+        job["raw_transcript"] = {}
+        job["raw_source_video_url"] = None
+        job["logs"] = list(job.get("logs") or [])[-79:]
+        _append_job_log(job, "queued", job["message"])
+        _cancel_events[job_id] = threading.Event()
+        _persist_job_locked(job)
+        snapshot = _job_snapshot(job)
+    _start_job_thread(job_id, req)
+    return snapshot
+
+
+@app.get("/api/jobs/{job_id}/logs")
+def download_job_logs(job_id: str):
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "job not found")
+        logs = job.get("logs") if isinstance(job.get("logs"), list) else []
+    lines = []
+    for entry in logs:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            timestamp = float(entry.get("t") or time.time())
+            if not math.isfinite(timestamp):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError, OSError):
+            timestamp = time.time()
+        stamp = datetime.fromtimestamp(timestamp).isoformat(timespec="seconds")
+        lines.append(f"{stamp} [{entry.get('stage', 'info')}] {entry.get('message', '')}")
+    return PlainTextResponse("\n".join(lines) + ("\n" if lines else ""), headers={"Content-Disposition": f'attachment; filename="shorts_{job_id}.log"'})
+
+
+@app.post("/api/open-folder")
+def open_folder(request: OpenFolderRequest) -> Dict[str, Any]:
+    """Open a safe local output folder on desktop builds."""
+    if request.job_id:
+        with _lock:
+            job = _jobs.get(request.job_id)
+            if not job:
+                raise HTTPException(404, "job not found")
+            folder = Path(str(job.get("output_dir") or _output_root))
+    else:
+        folder = _output_root
+    try:
+        folder = folder.expanduser().resolve()
+        folder.mkdir(parents=True, exist_ok=True)
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(400, f"output folder is unavailable: {exc}") from exc
+    try:
+        if os.name == "nt":
+            os.startfile(str(folder))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(folder)])
+        else:
+            subprocess.Popen(["xdg-open", str(folder)])
+    except OSError as exc:
+        raise HTTPException(500, f"could not open folder: {exc}") from exc
+    return {"status": "opened", "path": str(folder)}
 
 
 @app.post("/api/jobs/{job_id}/clips/{index}")
@@ -678,6 +1005,7 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
                 fit_mode=update.fit_mode,
                 zoom=update.zoom,
                 layout=update.layout,
+                output_height=update.output_height,
                 intro=request.get("intro") or None,
                 outro=request.get("outro") or None,
                 jump_cuts=bool(request.get("jump_cuts")),
@@ -704,6 +1032,7 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
                 "caption_size": update.caption_size,
                 "caption_color": update.caption_color,
                 "layout": update.layout,
+                "output_height": update.output_height,
             }
             replacement["undo_path"] = undo_path if os.path.isfile(undo_path) else None
             replacement["undo_metadata"] = {
@@ -735,6 +1064,7 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
                 "caption_size": update.caption_size,
                 "caption_color": update.caption_color,
                 "layout": update.layout,
+                "output_height": update.output_height,
                 "clip_url": crop_clip(
                     str(source),
                     update.start_time,
@@ -767,7 +1097,7 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
         result["shorts"] = _public_shorts(current, job_id)
         job["result"] = result
         job["message"] = f"Regenerated clip {index + 1}"
-        job["logs"].append({"t": time.time(), "stage": "edit", "message": job["message"]})
+        _append_job_log(job, "edit", job["message"])
         _persist_job_locked(job)
         return _job_snapshot(job)
 
@@ -817,6 +1147,61 @@ def get_timeline(job_id: str) -> Dict[str, Any]:
         }
 
 
+@app.get("/api/jobs/{job_id}/waveform")
+def get_waveform(job_id: str, bins: int = 240) -> Dict[str, Any]:
+    """Return cached audio peaks for a lightweight timeline waveform."""
+    bins = max(32, min(600, int(bins or 240)))
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "job not found")
+        source = job.get("raw_source_video_url")
+        output_dir = Path(str(job.get("output_dir") or (_jobs_dir / job_id))).expanduser().resolve()
+    if not source or not Path(str(source)).is_file():
+        return {"duration": 0.0, "peaks": [], "available": False}
+    source_path = Path(str(source)).expanduser().resolve()
+    cache_path = output_dir / "waveform.json"
+    try:
+        signature = [source_path.stat().st_size, source_path.stat().st_mtime_ns, bins]
+    except OSError:
+        signature = []
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        if isinstance(cached, dict) and cached.get("signature") == signature and isinstance(cached.get("peaks"), list):
+            return {"duration": float(cached.get("duration") or 0.0), "peaks": cached["peaks"], "available": True, "cached": True}
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        from shorts_generator.local.clipper import _find_ffmpeg
+
+        ffmpeg = _find_ffmpeg()
+        probe = subprocess.run(
+            [ffmpeg, "-hide_banner", "-i", str(source_path), "-f", "s16le", "-ac", "1", "-ar", "2000", "-v", "error", "-"],
+            capture_output=True,
+            timeout=90,
+            check=False,
+        )
+        raw = probe.stdout or b""
+        samples = array("h")
+        samples.frombytes(raw[: len(raw) - (len(raw) % 2)])
+        if not samples:
+            return {"duration": 0.0, "peaks": [], "available": False}
+        step = max(1, len(samples) // bins)
+        peaks = []
+        for start in range(0, len(samples), step):
+            window = samples[start : start + step]
+            peak = max((abs(value) for value in window), default=0) / 32768.0
+            peaks.append(round(min(1.0, peak), 4))
+            if len(peaks) >= bins:
+                break
+        duration = len(samples) / 2000.0
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps({"signature": signature, "duration": duration, "peaks": peaks}), encoding="utf-8")
+        return {"duration": duration, "peaks": peaks, "available": True, "cached": False}
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, TimeoutError) as exc:
+        return {"duration": 0.0, "peaks": [], "available": False, "error": str(exc)}
+
+
 @app.get("/api/jobs/{job_id}/export")
 def export_job(job_id: str):
     """Download a ZIP containing local clips and creator metadata."""
@@ -854,11 +1239,87 @@ def export_job(job_id: str):
             thumbnail = _job_media_path(job, short.get("thumbnail_path"))
             if thumbnail and thumbnail.is_file():
                 bundle.write(thumbnail, arcname=f"thumbnails/short_{index:02d}.jpg")
+            for caption_format in ("srt", "vtt"):
+                caption_text = _captions_for_short(short, job.get("raw_transcript"), caption_format)
+                if caption_text:
+                    bundle.writestr(f"captions/short_{index:02d}.{caption_format}", caption_text)
     archive.seek(0)
     return StreamingResponse(
         archive,
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="shorts_{job_id}.zip"'},
+    )
+
+
+def _subtitle_timestamp(seconds: object, vtt: bool = False) -> str:
+    try:
+        value = float(seconds)
+        if not math.isfinite(value) or value < 0:
+            value = 0.0
+    except (TypeError, ValueError, OverflowError):
+        value = 0.0
+    milliseconds = max(0, int(round(value * 1000)))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds_int, millis = divmod(remainder, 1000)
+    separator = "." if vtt else ","
+    return f"{hours:02d}:{minutes:02d}:{seconds_int:02d}{separator}{millis:03d}"
+
+
+def _captions_for_short(short: Dict[str, Any], transcript: Any, format_name: str = "srt") -> str:
+    if not isinstance(short, dict) or not isinstance(transcript, dict):
+        return ""
+    try:
+        clip_start = float(short.get("start_time"))
+        clip_end = float(short.get("end_time"))
+        if not math.isfinite(clip_start) or not math.isfinite(clip_end) or clip_end <= clip_start:
+            return ""
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    vtt = str(format_name).lower() == "vtt"
+    lines = ["WEBVTT", ""] if vtt else []
+    count = 0
+    for segment in _dict_items(transcript.get("segments")):
+        try:
+            start = float(segment.get("start"))
+            end = float(segment.get("end"))
+            if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+                continue
+        except (TypeError, ValueError, OverflowError):
+            continue
+        left = max(start, clip_start)
+        right = min(end, clip_end)
+        text = " ".join(str(segment.get("text") or "").split())
+        if right <= left or not text:
+            continue
+        count += 1
+        lines.append(f"{count}" if not vtt else "")
+        lines.append(f"{_subtitle_timestamp(left - clip_start, vtt)} --> {_subtitle_timestamp(right - clip_start, vtt)}")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines) if count else ""
+
+
+@app.get("/api/jobs/{job_id}/clip/{index}/captions")
+def download_clip_captions(job_id: str, index: int, format: str = "srt"):
+    format_name = str(format or "srt").strip().lower()
+    if format_name not in {"srt", "vtt"}:
+        raise HTTPException(400, "format must be srt or vtt")
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "job not found")
+        shorts = _dict_items(job.get("raw_shorts"))
+        transcript = job.get("raw_transcript")
+    if index < 0 or index >= len(shorts):
+        raise HTTPException(404, "clip not found")
+    text = _captions_for_short(shorts[index], transcript, format_name)
+    if not text:
+        raise HTTPException(404, "no captions available for this clip")
+    return PlainTextResponse(
+        text,
+        media_type="text/vtt" if format_name == "vtt" else "application/x-subrip",
+        headers={"Content-Disposition": f'attachment; filename="short_{index + 1:02d}.{format_name}"'},
     )
 
 
@@ -914,9 +1375,35 @@ def preview_clip(job_id: str, update: ClipUpdate) -> Dict[str, Any]:
     if style not in {"clean", "bold", "boxed", "karaoke"}:
         raise HTTPException(400, "caption_style must be clean, bold, boxed, or karaoke")
     from shorts_generator.local.clipper import crop_clip_local
+    preview_dir = Path(output_dir) / "previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        source_stat = Path(str(source)).stat()
+        source_stamp = [source_stat.st_size, source_stat.st_mtime_ns]
+    except OSError:
+        source_stamp = []
+    preview_payload = {
+        "source": source_stamp,
+        "start": update.start_time,
+        "end": update.end_time,
+        "caption_style": style,
+        "caption_position": update.caption_position,
+        "caption_font": update.caption_font,
+        "caption_size": update.caption_size,
+        "caption_color": update.caption_color,
+        "crop_position": update.crop_position,
+        "zoom": update.zoom,
+        "fit_mode": update.fit_mode,
+        "layout": update.layout,
+        "output_height": min(960, update.output_height or 1920),
+    }
+    preview_key = hashlib.sha256(json.dumps(preview_payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:20]
+    cached = preview_dir / f"preview_{preview_key}.mp4"
     preview = Path(output_dir) / "preview.mp4"
-    preview.parent.mkdir(parents=True, exist_ok=True)
-    render_path = preview.with_name("preview.render.mp4")
+    if cached.is_file():
+        shutil.copyfile(cached, preview)
+        return {"preview_url": f"/api/jobs/{job_id}/preview.mp4?key={preview_key}", "path": str(preview), "cached": True}
+    render_path = preview_dir / f"preview_{preview_key}.render.mp4"
     try:
         crop_clip_local(
             str(source), update.start_time, update.end_time,
@@ -937,20 +1424,22 @@ def preview_clip(job_id: str, update: ClipUpdate) -> Dict[str, Any]:
             auto_reframe=bool(request.get("auto_reframe", True)),
             crop_position=update.crop_position, fit_mode=update.fit_mode, zoom=update.zoom,
             layout=update.layout,
+            output_height=min(960, update.output_height or 1920),
             intro=request.get("intro") or None,
             outro=request.get("outro") or None,
             jump_cuts=bool(request.get("jump_cuts")),
         )
         if not render_path.is_file():
             raise RuntimeError("preview renderer did not produce an output file")
-        os.replace(render_path, preview)
+        os.replace(render_path, cached)
+        shutil.copyfile(cached, preview)
     finally:
         if render_path.is_file():
             try:
                 render_path.unlink()
             except OSError:
                 pass
-    return {"preview_url": f"/api/jobs/{job_id}/preview.mp4", "path": str(preview)}
+    return {"preview_url": f"/api/jobs/{job_id}/preview.mp4?key={preview_key}", "path": str(preview), "cached": False}
 
 
 @app.get("/api/jobs/{job_id}/preview.mp4")
@@ -959,8 +1448,9 @@ def get_preview(job_id: str):
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, "job not found")
-        path = Path(str(job.get("output_dir") or (_jobs_dir / job_id))) / "preview.mp4"
-    if not path.is_file():
+        output_dir = Path(str(job.get("output_dir") or (_jobs_dir / job_id)))
+        path = _job_media_path(job, output_dir / "preview.mp4")
+    if not path or not path.is_file():
         raise HTTPException(404, "preview not found")
     return FileResponse(path, media_type="video/mp4", filename=path.name)
 
@@ -1053,6 +1543,105 @@ def health() -> Dict[str, str]:
     return {"status": "ok", "output": str(Path(LOCAL_OUTPUT_DIR).resolve())}
 
 
+def _setup_state() -> Dict[str, Any]:
+    try:
+        value = json.loads(_setup_state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write_setup_state(values: Dict[str, Any]) -> None:
+    _output_root.mkdir(parents=True, exist_ok=True)
+    temporary = _setup_state_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(values, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, _setup_state_path)
+
+
+def _whisper_model_cached(model_name: str) -> bool:
+    model = str(model_name or "").strip()
+    if not model:
+        return False
+    roots = [
+        Path.home() / ".cache" / "huggingface" / "hub",
+        Path(os.getenv("LOCALAPPDATA", "")) / "huggingface" / "hub",
+    ]
+    token = f"models--Systran--faster-whisper-{model}"
+    return any((root / token).is_dir() for root in roots if str(root))
+
+
+def _setup_report() -> Dict[str, Any]:
+    state = _setup_state()
+    try:
+        usage = shutil.disk_usage(_output_root)
+        free_gb = round(usage.free / (1024 ** 3), 2)
+    except OSError:
+        free_gb = 0.0
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    gpu = gpu_status()
+    provider = str(LLM_PROVIDER or "openai").strip().lower()
+    provider_key = bool(OPENAI_API_KEY) if provider == "openai" else bool(GEMINI_API_KEY) if provider == "gemini" else False
+    warnings = []
+    if not ffmpeg:
+        warnings.append("FFmpeg is not available; local rendering cannot start until it is installed or bundled.")
+    if not ffprobe:
+        warnings.append("FFprobe is not available; media diagnostics will be limited.")
+    if free_gb < _min_free_gb:
+        warnings.append(f"Only {free_gb:.2f} GB of free disk space is available.")
+    if provider not in {"openai", "gemini"}:
+        warnings.append(f"Unknown LLM_PROVIDER={provider!r}; offline ranking will be used.")
+    return {
+        "first_run": not bool(state.get("setup_dismissed")),
+        "setup_dismissed": bool(state.get("setup_dismissed")),
+        "ffmpeg": {"ready": bool(ffmpeg), "path": ffmpeg},
+        "ffprobe": {"ready": bool(ffprobe), "path": ffprobe},
+        "gpu": gpu,
+        "whisper": {
+            "model": LOCAL_WHISPER_MODEL,
+            "device": LOCAL_WHISPER_DEVICE,
+            "model_cached": _whisper_model_cached(LOCAL_WHISPER_MODEL),
+        },
+        "keys": {
+            "muapi_configured": bool(MUAPI_API_KEY),
+            "openai_configured": bool(OPENAI_API_KEY),
+            "gemini_configured": bool(GEMINI_API_KEY),
+            "selected_provider": provider,
+            "selected_provider_configured": provider_key,
+            "offline_fallback": bool(LOCAL_HEURISTIC_FALLBACK),
+        },
+        "storage": {"output_root": str(_output_root), "free_disk_gb": free_gb, "minimum_free_gb": _min_free_gb},
+        "warnings": warnings,
+        "ready_for_local": bool(ffmpeg) and free_gb >= _min_free_gb,
+    }
+
+
+@app.get("/api/setup")
+def setup_report() -> Dict[str, Any]:
+    return _setup_report()
+
+
+@app.post("/api/setup/prepare")
+def prepare_setup(update: Optional[SetupStateUpdate] = None) -> Dict[str, Any]:
+    update = update or SetupStateUpdate()
+    try:
+        _output_root.mkdir(parents=True, exist_ok=True)
+        _jobs_dir.mkdir(parents=True, exist_ok=True)
+        _uploads_dir.mkdir(parents=True, exist_ok=True)
+        state = _setup_state()
+        state["setup_dismissed"] = bool(update.dismissed)
+        state["last_checked_at"] = time.time()
+        _write_setup_state(state)
+    except OSError as exc:
+        raise HTTPException(500, f"could not prepare local folders: {exc}") from exc
+    return _setup_report()
+
+
+@app.post("/api/setup/dismiss")
+def dismiss_setup(update: Optional[SetupStateUpdate] = None) -> Dict[str, Any]:
+    return prepare_setup(update)
+
+
 @app.post("/api/shutdown")
 def shutdown() -> Dict[str, str]:
     """Stop this local-only server (used by the portable launcher Quit button)."""
@@ -1073,6 +1662,7 @@ def system_status() -> Dict[str, Any]:
         "captions_enabled": LOCAL_BURN_CAPTIONS,
         "free_disk_gb": round(usage.free / (1024 ** 3), 2),
         "max_concurrent_jobs": _max_concurrent_jobs,
+        "setup": _setup_report(),
     }
 
 
@@ -1091,6 +1681,7 @@ def diagnostics() -> Dict[str, Any]:
         "free_disk_gb": round(shutil.disk_usage(_output_root).free / (1024 ** 3), 2),
         "job_counts": counts,
         "captions_enabled": LOCAL_BURN_CAPTIONS,
+        "setup": _setup_report(),
     }
 
 

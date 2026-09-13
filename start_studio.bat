@@ -6,9 +6,8 @@ if not exist "venv\Scripts\python.exe" (
   pause
   exit /b 1
 )
-start "Shorts Studio" /b venv\Scripts\python.exe -m web.app
-timeout /t 2 /nobreak >nul
-start "" http://127.0.0.1:7860
-echo Shorts Studio is running at http://127.0.0.1:7860
-echo Close the server with Ctrl+C if running in a terminal, or stop python.exe.
+start "Shorts Studio" /b venv\Scripts\python.exe launcher.py
+echo Shorts Studio is starting in its desktop window.
+echo If WebView2 is unavailable it will open the local UI in your browser.
+echo Use the Quit button inside Shorts Studio to close it.
 pause

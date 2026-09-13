@@ -452,6 +452,7 @@ def _reframe_vertical(
     fit_mode: str = "crop",
     zoom: float = 1.0,
     layout: str = "single",
+    output_height: int = 1920,
 ) -> str:
     """Crop the cut clip to the target aspect ratio, tracking faces if possible."""
     try:
@@ -463,10 +464,15 @@ def _reframe_vertical(
         ) from e
 
     target_ratio = _ratio(aspect_ratio)
+    try:
+        render_height = int(output_height)
+    except (TypeError, ValueError, OverflowError):
+        render_height = 1920
+    render_height = max(240, min(4320, render_height or 1920))
     layout_name = str(layout or "single").strip().lower()
     if layout_name == "split":
         ffmpeg = _find_ffmpeg()
-        out_h = 1920
+        out_h = render_height
         out_w = max(2, int(round(out_h * target_ratio)) // 2 * 2)
         half = max(2, out_w // 2)
         split_filter = f"[0:v]crop=iw/2:ih:0:0,scale={half}:{out_h}:force_original_aspect_ratio=decrease,pad={half}:{out_h}:(ow-iw)/2:(oh-ih)/2[left];[0:v]crop=iw/2:ih:iw/2:0,scale={half}:{out_h}:force_original_aspect_ratio=decrease,pad={half}:{out_h}:(ow-iw)/2:(oh-ih)/2[right];[left][right]hstack=inputs=2[v]"
@@ -475,7 +481,7 @@ def _reframe_vertical(
     fit_name = str(fit_mode or "crop").strip().lower()
     if fit_name == "fit_blur":
         ffmpeg = _find_ffmpeg()
-        out_h = 1920
+        out_h = render_height
         out_w = max(2, int(round(out_h * target_ratio)) // 2 * 2)
         zoom = max(0.5, min(1.5, _finite_float(zoom, 1.0)))
         filter_complex = (
@@ -505,12 +511,20 @@ def _reframe_vertical(
         fps = 30.0
 
     # Compute the largest crop that fits inside the frame at the target ratio.
+    # A zoom above 1.0 tightens that crop around the selected center; a zoom
+    # below 1.0 reveals more of the source while keeping the target canvas.
     if target_ratio < src_w / src_h:
         crop_h = src_h
         crop_w = int(crop_h * target_ratio)
     else:
         crop_w = src_w
         crop_h = int(crop_w / target_ratio)
+    # Crop-to-fill cannot reveal pixels outside the source frame.  Treat
+    # values below 100% as the largest possible crop rather than stretching a
+    # non-matching aspect ratio; zoom-out remains available in fit+blur mode.
+    zoom_value = max(1.0, min(1.5, _finite_float(zoom, 1.0)))
+    crop_w = int(round(crop_w / zoom_value))
+    crop_h = int(round(crop_h / zoom_value))
     crop_w = min(src_w, max(2, crop_w - (crop_w % 2)))
     crop_h = min(src_h, max(2, crop_h - (crop_h % 2)))
     if crop_w % 2:
@@ -528,7 +542,9 @@ def _reframe_vertical(
 
     silent_path = out_path + ".silent.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(silent_path, fourcc, fps, (crop_w, crop_h))
+    output_crop_h = render_height
+    output_crop_w = max(2, int(round(output_crop_h * target_ratio)) // 2 * 2)
+    writer = cv2.VideoWriter(silent_path, fourcc, fps, (output_crop_w, output_crop_h))
     if not writer.isOpened():
         cap.release()
         raise RuntimeError(f"could not create temporary video writer for {out_path}")
@@ -569,6 +585,8 @@ def _reframe_vertical(
         x0 = max(0, min(src_w - crop_w, cx - crop_w // 2))
         y0 = max(0, min(src_h - crop_h, cy - crop_h // 2))
         cropped = frame[y0:y0 + crop_h, x0:x0 + crop_w]
+        if cropped.shape[1] != output_crop_w or cropped.shape[0] != output_crop_h:
+            cropped = cv2.resize(cropped, (output_crop_w, output_crop_h), interpolation=cv2.INTER_AREA)
         writer.write(cropped)
 
     cap.release()
@@ -621,6 +639,7 @@ def crop_clip_local(
     intro: Optional[str] = None,
     outro: Optional[str] = None,
     jump_cuts: bool = False,
+    output_height: int = 1920,
 ) -> str:
     """Cut + reframe one highlight, optionally burning Whisper captions."""
     source_path = str(source_path) if source_path is not None else ""
@@ -657,6 +676,7 @@ def crop_clip_local(
             fit_mode=fit_mode,
             zoom=zoom,
             layout=layout,
+            output_height=output_height,
         )
         if burn_captions and caption_segments:
             _burn_in_captions(
@@ -686,7 +706,7 @@ def crop_clip_local(
         audio_filters.append("loudnorm=I=-14:TP=-1.5:LRA=11")
     if denoise_audio:
         audio_filters.append("afftdn=nf=-25")
-    if audio_filters:
+    if audio_filters and _has_audio_stream(out_path):
         processed_path = out_path + ".audio.mp4"
         try:
             ffmpeg = _find_ffmpeg()
@@ -702,7 +722,7 @@ def crop_clip_local(
         finally:
             if os.path.exists(processed_path):
                 _remove_with_retry(processed_path)
-    if jump_cuts:
+    if jump_cuts and _has_audio_stream(out_path):
         jump_path = out_path + ".jump.mp4"
         try:
             _remove_silent_video(out_path, jump_path)
@@ -777,7 +797,11 @@ def crop_clip_local(
                 # Intro/outro files commonly have different dimensions from
                 # the generated vertical clip. Normalize every video stream
                 # to the selected output canvas before concatenating.
-                concat_h = 1920
+                try:
+                    concat_h = int(output_height)
+                except (TypeError, ValueError, OverflowError):
+                    concat_h = 1920
+                concat_h = max(240, min(4320, concat_h or 1920))
                 concat_w = max(2, int(round(concat_h * _ratio(aspect_ratio))) // 2 * 2)
                 normalized = []
                 for i in range(len(concat_inputs)):
@@ -805,6 +829,9 @@ def crop_clip_local(
 def _remove_silent_video(in_path: str, out_path: str, threshold: str = "-40dB", min_silence: float = 0.35) -> bool:
     """Remove silent intervals from both video and audio using FFmpeg concat."""
     ffmpeg = _find_ffmpeg()
+    if not _has_audio_stream(in_path):
+        shutil.copyfile(in_path, out_path)
+        return False
     detect = subprocess.run(
         [ffmpeg, "-hide_banner", "-i", in_path, "-af", f"silencedetect=noise={threshold}:d={min_silence}", "-f", "null", "-"],
         capture_output=True, text=True, check=False,
@@ -865,6 +892,7 @@ def crop_highlights_local(
     intro: Optional[str] = None,
     outro: Optional[str] = None,
     jump_cuts: bool = False,
+    output_height: int = 1920,
 ) -> List[Dict]:
     out_dir = out_dir or LOCAL_OUTPUT_DIR
     os.makedirs(out_dir, exist_ok=True)
@@ -910,6 +938,9 @@ def crop_highlights_local(
                 denoise_audio=denoise_audio,
                 remove_filler_words=remove_filler_words,
                 caption_position=caption_position,
+                caption_font=caption_font,
+                caption_size=caption_size,
+                caption_color=caption_color,
                 background_music=background_music,
                 watermark=watermark,
                 auto_reframe=auto_reframe,
@@ -920,6 +951,7 @@ def crop_highlights_local(
                 intro=intro,
                 outro=outro,
                 jump_cuts=jump_cuts,
+                output_height=output_height,
             )
             item = {**h, "clip_url": out_path}
             try:

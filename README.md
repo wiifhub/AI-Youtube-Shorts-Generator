@@ -5,6 +5,8 @@
 
 **The open-source alternative to Opus Clip, Vidyo.ai, Klap, SubMagic, 2short.ai, and other AI clipping tools.** Drop in any long-form YouTube video and get ranked, viral-ready 9:16 shorts locally or through an optional API. Local rendering has no built-in per-clip service limit; API and LLM provider charges follow their own terms.
 
+**Current release: [Shorts Studio v0.7.0](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/tag/v0.7.0).** It adds a browser-free native desktop window, first-run diagnostics, recoverable project management, cached previews and waveforms, resumable jobs, caption-file exports, and safer Windows packaging.
+
 Built for creators, agencies, and developers who don't want to pay $20–$300/month or be capped on minutes processed. Uses GPT-class LLM highlight detection and Whisper transcription to extract the most viral-worthy moments and auto-crop them vertically for TikTok, Reels, and Shorts.
 
 <p align="center"><a href="https://www.youtube.com/watch?v=kT1CO4BYV3A"><img src="https://i.ytimg.com/vi/kT1CO4BYV3A/maxresdefault.jpg" width="720"></a></p>
@@ -64,6 +66,12 @@ The local web application adds the complete creator workflow:
 - Project presets for podcast/interview, educational, reaction/gaming, and story videos; generated titles, descriptions, hashtags, and platform publishing metadata.
 - Optional Save folder creates named job folders such as `20260910_214500_shorts_source_a1b2c3d4` containing source cache, transcript, clips, thumbnails, `metadata.json`, and any preview media.
 - Whisper model/device controls (`tiny` through `large-v3`; Auto, CPU, or CUDA) with live CUDA status and safe CPU fallback.
+- **Browser-free desktop mode** uses an embedded WebView2 window when available, with a tray menu, single-instance protection, automatic port fallback, and a real Quit action. Set `SHORTS_STUDIO_BROWSER=true` when you specifically want the browser fallback.
+- **First-run setup wizard** checks FFmpeg/FFprobe, storage, CUDA, Whisper cache, and optional ranking credentials, then prepares writable folders with a single click.
+- **Project library controls** include rename, duplicate-to-draft, archive/unarchive, recoverable delete, Undo last delete, and automatic recovery of jobs interrupted by a restart.
+- **Faster review** caches low-resolution previews by settings and builds a cached audio waveform for the transcript timeline.
+- **Reliable operations** persist stage logs, expose Retry for failed/interrupted jobs, enforce a configurable free-space guard, clean renderer scratch files, and keep finished media intact after failures.
+- **Professional exports** include ZIP manifests plus per-clip SRT and VTT caption downloads; local output height can be selected at 1080p, 1920p, or 2160p.
 
 ### Web UI workspace
 
@@ -130,21 +138,27 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
    LOCAL_WHISPER_DEVICE=auto         # auto / cpu / cuda
    LOCAL_OUTPUT_DIR=output           # where local mp4s land
    LOCAL_HEURISTIC_FALLBACK=true     # rank offline when no LLM key is configured
+   SHORTS_STUDIO_BROWSER=false       # true to force the browser fallback
+   SHORTS_PORT=7860                  # preferred local port; launcher falls back if busy
+   SHORTS_AUTO_RESUME=true           # resume jobs interrupted by a restart
+   SHORTS_MIN_FREE_GB=0.5            # refuse new jobs below this free-space guard
    ```
 
 ## Usage
 
 ### Web UI
 
-On Windows, from the downloaded/cloned project folder, double-click `install_windows.bat` once. It creates the virtual environment, installs all dependencies, and creates `.env` from `.env.example`. Then double-click `start_studio.bat` (or run `python -m web.app` inside the activated environment). The app uses the current local source tree when started this way.
+On Windows, from the downloaded/cloned project folder, double-click `install_windows.bat` once. It creates the virtual environment, installs all dependencies, and creates `.env` from `.env.example`. Then double-click `start_studio.bat` to launch the native desktop window (or run `python launcher.py`). The app uses the current local source tree when started this way. If WebView2 is unavailable, the launcher opens the same UI in your default browser. To force that fallback, run `python launcher.py --browser` or set `SHORTS_STUDIO_BROWSER=true`.
+
+The native launcher keeps a single instance per Windows user, chooses another local port if 7860 is busy, and adds an optional system-tray menu. Close the window, choose **Quit** in the UI, or choose **Quit** from the tray. Generated data is stored in `LOCAL_OUTPUT_DIR`; packaged installs use `%LOCALAPPDATA%\ShortsStudio\output` so Program Files permissions do not block renders.
 
 ### Portable Windows executable
 
-Download the current [ShortsStudio-v0.6.3-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.6.3/ShortsStudio-v0.6.3-windows.zip) and extract the entire ZIP. Open the `ShortsStudio` folder and double-click `unblock_and_start.bat`; it removes the download block from the extracted files and starts `ShortsStudio.exe`. You can also launch the executable directly after choosing **More info > Run anyway** once. Keep the whole folder together because it includes the runtime, CTranslate2, CUDA 12 runtime libraries, and FFmpeg binaries. Add a `.env` file beside the executable with OpenAI or Gemini credentials for AI ranking; otherwise Local mode automatically uses offline transcript ranking. Use **Quit Shorts Studio** in the page to stop the server cleanly.
+Download the current [ShortsStudio-v0.7.0-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.7.0/ShortsStudio-v0.7.0-windows.zip) and extract the entire ZIP. Open the `ShortsStudio` folder and double-click `unblock_and_start.bat`; it removes the download block from the extracted files and starts `ShortsStudio.exe` in its native window. You can also launch the executable directly after choosing **More info > Run anyway** once. Keep the whole folder together because it includes the runtime, WebView2 shell dependencies, CTranslate2, optional CUDA 12 runtime libraries, and FFmpeg binaries. Add a `.env` file beside the executable with OpenAI or Gemini credentials for AI ranking; otherwise Local mode automatically uses offline transcript ranking. Use **Quit** in the page or tray to stop the server cleanly.
 
 ### Installed Windows application
 
-For a normal Windows installation, download [ShortsStudio-Setup-v0.6.3.exe](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.6.3/ShortsStudio-Setup-v0.6.3.exe). The installer adds a Start Menu entry, offers a Desktop shortcut, installs the bundled runtime and FFmpeg, and registers an uninstaller. The app still runs locally at `http://127.0.0.1:7860`; no cloud account is required for the UI.
+For a normal Windows installation, download [ShortsStudio-Setup-v0.7.0.exe](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v0.7.0/ShortsStudio-Setup-v0.7.0.exe). The installer adds a Start Menu entry, offers a Desktop shortcut, installs the bundled runtime and FFmpeg, and registers a normal uninstaller. The app runs locally in its native window; no cloud account is required for the UI. If the preferred port is already in use, the launcher selects another loopback port automatically.
 
 For a source checkout, install dependencies, then:
 
@@ -153,7 +167,7 @@ pip install -r requirements.txt
 python -m web.app
 ```
 
-Open [http://127.0.0.1:7860](http://127.0.0.1:7860). Paste a YouTube URL, choose local or API mode, or drag in a video file. The UI supports caption presets (Bold, Clean, Boxed, Karaoke), highlight focus modes, silence/audio cleanup, batch sources, manual per-clip timestamp edits, and creator metadata. Jobs and results are saved under `output/jobs/`, so refreshing or reopening the UI keeps the recent-job history and playable local clips. Completed jobs can be downloaded as a ZIP containing local clips and `metadata.json`.
+Open the address shown by the launcher (normally [http://127.0.0.1:7860](http://127.0.0.1:7860) when using the browser fallback). Paste a YouTube URL, choose local or API mode, or drag in a video file. The UI supports caption presets (Bold, Clean, Boxed, Karaoke), highlight focus modes, silence/audio cleanup, batch sources, manual per-clip timestamp edits, and creator metadata. Jobs and results are saved under `output/jobs/`, so refreshing or reopening the UI keeps the recent-job history and playable local clips. Completed jobs can be downloaded as a ZIP containing local clips, SRT/VTT captions, and `metadata.json`.
 
 ### GPU acceleration (Windows)
 
@@ -268,12 +282,25 @@ When the web app is running, these local routes are available:
 | `GET /api/health` | Confirm the server and output directory |
 | `GET /api/system` | FFmpeg, Whisper, CUDA, disk, and concurrency status |
 | `GET /api/diagnostics` | Runtime paths, job counts, and diagnostics |
+| `GET /api/setup` | First-run readiness checks and writable storage details |
+| `POST /api/setup/prepare` | Create local data folders and mark setup complete |
+| `POST /api/setup/dismiss` | Mark the first-run check as reviewed |
 | `POST /api/jobs` | Queue one URL or local video |
 | `POST /api/jobs/batch` | Queue multiple sources |
-| `GET /api/jobs` | List persisted recent jobs |
+| `GET /api/jobs` | List persisted recent jobs (`include_archived=true` includes archived projects) |
+| `PATCH /api/jobs/{id}` | Rename a project |
+| `POST /api/jobs/{id}/archive` | Archive or unarchive a project |
+| `POST /api/jobs/{id}/duplicate` | Create a clean draft from saved settings |
+| `DELETE /api/jobs/{id}` | Soft-delete a project record while preserving media |
+| `POST /api/jobs/{id}/restore` | Restore the last soft-deleted project record |
+| `POST /api/jobs/{id}/retry` | Retry a failed, interrupted, or draft job |
+| `GET /api/jobs/{id}/logs` | Download the bounded stage log |
 | `POST /api/jobs/{id}/preview` | Render a review preview |
+| `GET /api/jobs/{id}/waveform` | Return a cached lightweight audio waveform |
 | `POST /api/jobs/{id}/clips/{index}` | Regenerate one edited clip |
 | `POST /api/jobs/{id}/clips/{index}/undo` | Restore the previous clip version |
+| `GET /api/jobs/{id}/clip/{index}/captions?format=srt\|vtt` | Download a clip caption file |
+| `POST /api/open-folder` | Open the safe output folder on the desktop |
 | `GET /api/jobs/{id}/export` | Download clips, thumbnails, and publishing metadata as ZIP |
 | `POST /api/shutdown` | Stop a local/portable server cleanly |
 
@@ -375,6 +402,7 @@ AI-Youtube-Shorts-Generator/
 
 - `launcher.py` is the PyInstaller entry point for the portable executable.
 - `web/app.py` and `web/static/index.html` provide the Shorts Studio dashboard and editor workspace.
+- `requirements-local.txt` includes the optional native shell (`pywebview`), tray icon (`pystray`), and image runtime (`Pillow`).
 - `install_windows.bat` creates a source-install virtual environment.
 - `install_gpu_windows.bat` adds optional CUDA-enabled PyTorch diagnostics for source installs.
 - `installer/ShortsStudio.iss` and `build_installer.bat` build the Inno Setup installer.
@@ -413,6 +441,12 @@ Local clip edits can be previewed, regenerated, and reverted with the per-clip *
 Local renders also accept optional intro and outro MP4 paths, and can apply FFmpeg noise reduction alongside loudness normalization.
 
 The generated ZIP includes `metadata.json` plus platform-ready title, description, hashtag, and thumbnail-hook metadata for YouTube Shorts, TikTok, and Instagram Reels. Local preview and regeneration use the same framing, captions, audio, and layout settings as the final render.
+
+The project library supports rename, duplicate-to-draft, archive/unarchive, soft-delete, and **Undo last delete**. Deleted project records move to `output/.trash/`; rendered media is deliberately preserved. Jobs that were running when the app stopped are marked interrupted and automatically resume on the next launch when `SHORTS_AUTO_RESUME=true`.
+
+The first-run dialog checks FFmpeg, FFprobe, CUDA, the selected Whisper cache, optional LLM credentials, and available disk space. The render queue writes a bounded log per job, exposes Retry for recoverable failures, and refuses new work when free space is below `SHORTS_MIN_FREE_GB`. Preview renders are downscaled and cached by their source/settings signature, while the timeline waveform is generated once and cached beside the job.
+
+For a browser-free experience, use the packaged executable or `start_studio.bat`; it opens an embedded WebView2 window. The local HTTP API remains available for automation and the browser fallback remains available with `--browser`.
 
 To close the standalone app, click **Quit Shorts Studio** in the web page. It stops the local server and leaves a clear closed confirmation page; closing the browser tab alone does not stop a manually launched server.
 

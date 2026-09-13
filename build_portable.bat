@@ -8,7 +8,7 @@ if not exist "venv\Scripts\python.exe" (
 )
 
 echo Building Shorts Studio portable executable...
-venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onedir --name ShortsStudio --console --add-data "web;web" --add-data "shorts_generator;shorts_generator" --hidden-import web.app --collect-submodules shorts_generator launcher.py
+venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onedir --name ShortsStudio --windowed --add-data "web;web" --add-data "shorts_generator;shorts_generator" --hidden-import web.app --collect-submodules shorts_generator --collect-all webview --collect-all pystray --collect-all PIL launcher.py
 if errorlevel 1 exit /b 1
 
 if not exist "dist\ShortsStudio\ShortsStudio.exe" (

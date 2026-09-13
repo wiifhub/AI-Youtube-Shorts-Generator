@@ -59,6 +59,7 @@ def _run_local(
     layout: str = "single",
     whisper_model: Optional[str] = None,
     whisper_device: Optional[str] = None,
+    output_height: int = 1920,
 ) -> Dict:
     from .local.clipper import crop_highlights_local
     from .local.downloader import download_youtube_local
@@ -146,6 +147,7 @@ def _run_local(
         outro=outro,
         jump_cuts=jump_cuts,
         layout=layout,
+        output_height=output_height,
     )
 
     return {
@@ -229,6 +231,7 @@ def generate_shorts(
     layout: str = "single",
     whisper_model: Optional[str] = None,
     whisper_device: Optional[str] = None,
+    output_height: int = 1920,
 ) -> Dict:
     """Run the full pipeline and return a structured result.
 
@@ -254,6 +257,7 @@ def generate_shorts(
         crop_position: manual horizontal crop position from 0 (left) to 1 (right).
         fit_mode: crop to fill, or fit the full frame over a blurred background.
         zoom: fit-mode foreground scale from 0.5 (out) to 1.5 (in).
+        output_height: local output canvas height in pixels (0 keeps 1920).
 
     Returns:
         {
@@ -301,6 +305,7 @@ def generate_shorts(
             layout,
             whisper_model,
             whisper_device,
+            output_height,
         )
     if mode == "api":
         return _run_api(
