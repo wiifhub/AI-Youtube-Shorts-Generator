@@ -109,10 +109,18 @@ def _make_tray(window: Any, server: Any) -> Optional[Any]:
     except Exception:
         return None
 
-    image = Image.new("RGBA", (64, 64), (16, 22, 38, 255))
-    draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((6, 6, 58, 58), radius=14, fill=(94, 231, 239, 255))
-    draw.text((24, 17), "S", fill=(7, 16, 25, 255))
+    icon_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "assets" / "shorts_studio_icon.ico"
+    try:
+        source = Image.open(icon_path).convert("RGBA")
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        source.thumbnail((64, 64), resample)
+        image = Image.new("RGBA", (64, 64), (16, 22, 38, 255))
+        image.alpha_composite(source, ((64 - source.width) // 2, (64 - source.height) // 2))
+    except Exception:
+        image = Image.new("RGBA", (64, 64), (16, 22, 38, 255))
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle((6, 6, 58, 58), radius=14, fill=(94, 231, 239, 255))
+        draw.text((24, 17), "S", fill=(7, 16, 25, 255))
 
     def show(_icon: Any, _item: Any) -> None:
         try:
