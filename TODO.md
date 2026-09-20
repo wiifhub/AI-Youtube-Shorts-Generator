@@ -10,6 +10,10 @@ This is the canonical implementation backlog. Inline `TODO` comments should
 point to an item here; completed capabilities belong in `ROADMAP.md` rather
 than remaining as open TODOs.
 
+## Documentation maintenance
+
+- [x] Import the latest fork comparison's related-project links into `README.md`.
+
 ## v0.11.3 follow-up (released)
 
 - [x] **T-034 Packaged Local runtime completeness** - Fixed PyInstaller

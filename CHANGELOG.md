@@ -4,7 +4,10 @@ All notable Shorts Studio changes are recorded here. Dates use ISO 8601.
 
 ## [Unreleased]
 
-No unreleased changes.
+### Documentation
+
+- Added the latest fork comparison's related-project links for the broader
+  open-source SaaS catalog and MuAPI alternatives.
 
 ## [1.0.0] - 2026-09-15
 
