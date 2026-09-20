@@ -3,7 +3,7 @@
 **Published baseline:** v1.0.0 (local and remote gates passed)
 **Current development branch:** `main` (v1.0.0 production release)
 **Next implementation target:** v2.0.0
-**Last updated:** 2026-09-15
+**Last updated:** 2026-09-19
 
 The actionable implementation list now lives in [TODO.md](TODO.md). This
 roadmap tracks release milestones and verified state; it is not a second
@@ -385,3 +385,5 @@ tracking, not a second backlog.
 - **Breaking changes:** Defer to v1.0.0; no API breaks before then
 - **Dependency updates:** Review quarterly via `pip-audit`; pin to known-good versions and test the Starlette TestClient dependency warning
 - **TODO cleanup:** Close the matching TODO.md item only after code, tests, and the relevant runtime smoke check pass; record release work in `CHANGELOG.md`
+- **Related-project links:** Keep README ecosystem references current when
+  importing documentation changes from maintained forks.
