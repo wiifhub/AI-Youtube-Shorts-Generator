@@ -820,3 +820,125 @@ def test_concurrent_retries_start_only_one_render_per_project(client: TestClient
 
     assert sorted(outcomes) == [200] + [409] * (racers - 1)
     assert len(renders) == 1
+
+
+def _local_render_job(monkeypatch: pytest.MonkeyPatch, tmp_path, job_id: str):
+    """Register one completed local project with a regenerable clip."""
+    monkeypatch.setattr(studio, "_output_root", tmp_path)
+    monkeypatch.setattr(studio, "_jobs_dir", tmp_path / "jobs")
+    monkeypatch.setattr(studio, "_allow_external_paths", False)
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    output_dir = tmp_path / "jobs" / job_id
+    output_dir.mkdir(parents=True)
+    clip_path = output_dir / "short_01.mp4"
+    clip_path.write_bytes(b"original-clip")
+    with studio._lock:
+        studio._jobs[job_id] = {
+            "id": job_id,
+            "name": "Render scratch",
+            "status": "done",
+            "message": "done",
+            "progress": 100,
+            "request": {"url": str(source), "mode": "local", "aspect_ratio": "9:16"},
+            "result": {"mode": "local", "shorts": [{"title": "clip one", "clip_url": str(clip_path)}]},
+            "raw_shorts": [
+                {"title": "clip one", "clip_url": str(clip_path), "start_time": 1.0, "end_time": 5.0}
+            ],
+            "raw_transcript": {"duration": 30.0, "segments": []},
+            "raw_source_video_url": str(source),
+            "output_dir": str(output_dir),
+            "logs": [],
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "archived": False,
+        }
+        studio._persist_job_locked(studio._jobs[job_id])
+    return clip_path
+
+
+def test_concurrent_clip_regenerations_do_not_share_one_scratch_file(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Two regenerations of one clip must render to their own scratch files.
+
+    FFmpeg truncates its output, so a shared scratch path leaves a partial
+    render that is then moved over the previous good clip.
+    """
+    from web import editor_routes
+    from web.models import ClipUpdate
+
+    clip_path = _local_render_job(monkeypatch, tmp_path, "scratch-clip-job")
+    gate = threading.Barrier(2)
+    render_paths: list[str] = []
+    render_lock = threading.Lock()
+
+    def fake_render(_source, _start, _end, _aspect, out_path, **_kwargs):
+        thread = threading.get_ident()
+        with render_lock:
+            render_paths.append(str(out_path))
+        gate.wait(timeout=15)
+        with open(out_path, "wb") as stream:
+            stream.write(f"render-{thread}".encode())
+        return str(out_path)
+
+    monkeypatch.setattr("shorts_generator.local.clipper.crop_clip_local", fake_render)
+
+    def regenerate(start: float) -> None:
+        try:
+            editor_routes.update_clip(
+                "scratch-clip-job", 0, ClipUpdate(start_time=start, end_time=start + 2.0)
+            )
+        except Exception:  # noqa: BLE001 - the racing loser may fail its commit
+            pass
+
+    threads = [threading.Thread(target=regenerate, args=(1.0,)), threading.Thread(target=regenerate, args=(20.0,))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+
+    assert len(render_paths) == 2
+    assert render_paths[0] != render_paths[1]
+    assert clip_path.read_bytes().startswith(b"render-")
+
+
+def test_concurrent_previews_do_not_share_one_scratch_file(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Two identical preview requests must render to their own scratch files."""
+    from web import editor_routes
+    from web.models import ClipUpdate
+
+    _local_render_job(monkeypatch, tmp_path, "scratch-preview-job")
+    gate = threading.Barrier(2)
+    render_paths: list[str] = []
+    render_lock = threading.Lock()
+
+    def fake_render(_source, _start, _end, _aspect, out_path, **_kwargs):
+        thread = threading.get_ident()
+        with render_lock:
+            render_paths.append(str(out_path))
+        gate.wait(timeout=15)
+        with open(out_path, "wb") as stream:
+            stream.write(f"render-{thread}".encode())
+        return str(out_path)
+
+    monkeypatch.setattr("shorts_generator.local.clipper.crop_clip_local", fake_render)
+
+    def preview() -> None:
+        try:
+            editor_routes.preview_clip(
+                "scratch-preview-job", ClipUpdate(start_time=2.0, end_time=6.0)
+            )
+        except Exception:  # noqa: BLE001 - the racing loser may fail its replace
+            pass
+
+    threads = [threading.Thread(target=preview), threading.Thread(target=preview)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+
+    assert len(render_paths) == 2
+    assert render_paths[0] != render_paths[1]

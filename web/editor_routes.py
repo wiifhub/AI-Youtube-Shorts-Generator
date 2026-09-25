@@ -293,7 +293,7 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
                 job_output_dir = str(studio._job_output_dir(job))
                 out_path = str(Path(job_output_dir).expanduser().resolve() / _output_filename(index + 1))
             undo_path = out_path + ".undo.mp4"
-            render_path = out_path + ".regenerate.mp4"
+            render_path = studio._media_scratch_path(out_path, ".regenerate.mp4")
             timeline_map = []
             background_music = _local_asset(studio, job, request.get("background_music"), "background music")
             watermark = _local_asset(studio, job, request.get("watermark"), "watermark")
@@ -1091,7 +1091,7 @@ def preview_clip(job_id: str, update: ClipUpdate) -> Dict[str, Any]:
             "path": str(preview),
             "cached": True,
         }
-    render_path = preview_dir / f"preview_{preview_key}.render.mp4"
+    render_path = Path(studio._media_scratch_path(str(preview_dir / f"preview_{preview_key}.mp4"), ".render.mp4"))
     try:
         with studio._media_operation(job_id), runtime_job_control(
             cancel_check=lambda: studio._job_cancelled(job_id),

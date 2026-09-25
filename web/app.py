@@ -727,6 +727,17 @@ def _media_operation(job_id: str):
         _media_slots.release()
 
 
+def _media_scratch_path(target: str, suffix: str) -> str:
+    """Return a request-unique scratch path beside a render target.
+
+    FFmpeg truncates its output file, so two concurrent renders that share one
+    scratch path leave a partial result that is then moved over the previous
+    good render.  The trailing ``suffix`` is kept so the job/media scratch
+    cleanup still recognises and removes the file.
+    """
+    return f"{target}.{uuid.uuid4().hex[:8]}{suffix}"
+
+
 def _run_media_command(job_id: str, args: List[str], timeout: float = 90.0) -> subprocess.CompletedProcess[Any]:
     """Run an editor subprocess with process tracking, timeout, and cancel support."""
     with _media_operation(job_id):
