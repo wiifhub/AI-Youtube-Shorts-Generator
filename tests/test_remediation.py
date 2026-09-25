@@ -1712,6 +1712,66 @@ def test_dependency_payload_echo_is_scrubbed_from_every_copy(
     _assert_credential_never_returned_or_stored(client, job_id, key)
 
 
+def test_short_configured_secret_does_not_rewrite_creator_content(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A durable scrub must not rewrite the transcript to hide a weak secret.
+
+    The log policy masks any configured value from four characters up, which is
+    right for a disposable log line.  The same match inside the creator's own
+    transcript, clip title or caption file is silent data loss, so the record
+    owner only rewrites a value long enough to be a credential.
+    """
+    monkeypatch.setenv("OLLAMA_API_KEY", "ollama")
+    transcript = "the demo shows how ollama runs a local model without a cloud key"
+    job_id = _run_render(
+        client,
+        monkeypatch,
+        lambda: {
+            "mode": "api",
+            "source_video_url": "https://cdn.example/v.mp4",
+            "highlights": [{"start": 0.0, "end": 1.0, "note": f"ollama note {_SESSION_MUAPI_KEY}"}],
+            "shorts": [
+                {
+                    "index": 0,
+                    "title": "running ollama",
+                    "start_time": 0.0,
+                    "end_time": 1.0,
+                    "virality_reason": f"provider said {_SESSION_MUAPI_KEY}",
+                }
+            ],
+            "transcript": {"text": transcript, "segments": [{"start": 0.0, "end": 1.0, "text": transcript}]},
+            "llm": {"provider": "ollama", "model": "x", "usage": {"api_key": _SESSION_MUAPI_KEY}},
+        },
+        _SESSION_MUAPI_KEY,
+        "Fetching source video...",
+    )
+
+    with studio._lock:
+        stored = json.dumps(studio._jobs[job_id], default=str)
+    assert transcript in stored
+    assert "running ollama" in stored
+    # The credential-shaped value is still scrubbed, so the record is not wider open.
+    assert _SESSION_MUAPI_KEY not in stored
+
+    manifest = studio._jobs_dir / job_id / "metadata.json"
+    assert manifest.is_file()
+    manifest_text = manifest.read_text(encoding="utf-8")
+    assert transcript in manifest_text
+    assert _SESSION_MUAPI_KEY not in manifest_text
+
+    # The transport still masks short values on the way out; what must survive
+    # is the stored work and the caption file derived from it.
+    returned = client.get(f"/api/jobs/{job_id}")
+    assert returned.status_code == 200
+    assert _SESSION_MUAPI_KEY not in returned.text
+
+    captions = client.get(f"/api/jobs/{job_id}/clip/0/captions")
+    assert captions.status_code == 200
+    assert "ollama" in captions.text
+    assert "[redacted]" not in captions.text
+
+
 def test_ordinary_narration_is_left_byte_for_byte(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     """The value policy must not rewrite a record that holds no credential."""
     narration = "Cropping 3 of 10 candidates..."
@@ -1738,3 +1798,57 @@ def test_ordinary_narration_is_left_byte_for_byte(client: TestClient, monkeypatc
     assert narration.encode("utf-8") in mirror
     # Nothing was rewritten, because nothing in the record was a credential.
     assert b"[redacted]" not in mirror
+
+
+# ---------------------------------------------------------------------------
+# A project id that cannot name a record is a not-found, not a server error
+# ---------------------------------------------------------------------------
+
+# Decoded by the router before the id reaches the handler, so these are the
+# traversal and absolute shapes a crafted request can actually deliver.
+_UNNAMEABLE_JOB_IDS = (
+    "..%5C..%5Csentinel",
+    "C:%5CWindows%5Csentinel.mp4",
+    "aux.json",
+    "4842fc03c57e%00",
+)
+
+
+@pytest.mark.parametrize("job_id", _UNNAMEABLE_JOB_IDS)
+def test_unnameable_project_id_is_not_a_server_error(client: TestClient, job_id: str) -> None:
+    """The trash lookup must answer not-found, not escape as an unhandled error.
+
+    Every sibling record route already answers 404 for the same input; this one
+    raised a bare ``ValueError``, which reached the client as a 500 and logged a
+    stack trace for a request anybody can send.
+    """
+    with TestClient(studio.app, raise_server_exceptions=False) as tolerating:
+        deleted = tolerating.delete(f"/api/jobs/{job_id}")
+        restored = tolerating.post(f"/api/jobs/{job_id}/restore")
+    assert deleted.status_code == 404, deleted.text
+    assert restored.status_code == 404, restored.text
+
+
+def test_delete_and_restore_round_trip_still_works(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The not-found answer must not replace a working trash round trip."""
+    monkeypatch.setattr(studio, "_min_free_gb", 0)
+    _capture_started(monkeypatch)
+    source = studio._output_root / "control-source.mp4"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"video")
+    created = client.post("/api/jobs", json={"url": str(source), "mode": "local"})
+    assert created.status_code == 200
+    job_id = created.json()["id"]
+    with studio._lock:
+        studio._jobs[job_id]["status"] = "error"
+        studio._persist_job_locked(studio._jobs[job_id])
+
+    assert client.delete(f"/api/jobs/{job_id}").status_code == 200
+    assert (studio._trash_dir / f"{job_id}.json").is_file()
+
+    restored = client.post(f"/api/jobs/{job_id}/restore")
+    assert restored.status_code == 200
+    assert restored.json()["id"] == job_id
+    assert job_id in studio._jobs

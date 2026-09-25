@@ -274,8 +274,14 @@ def duplicate_job(job_id: str) -> Dict[str, Any]:
 
 
 def _trash_path(studio: Any, job_id: str) -> Path:
+    """Resolve the trash record for one job id, refusing anything else.
+
+    This is the only owner of "which file does this id name", so an id that
+    cannot name a record answers with the same not-found the sibling delete
+    route returns instead of escaping as an unhandled error.
+    """
     if not studio._job_id_pattern.fullmatch(str(job_id)):
-        raise ValueError("invalid job id")
+        raise HTTPException(404, {"error": "job not found", "code": "job_not_found"})
     return studio._trash_dir / f"{job_id}.json"
 
 

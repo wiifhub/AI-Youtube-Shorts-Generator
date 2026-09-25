@@ -206,6 +206,15 @@ def _redact_record_secrets_in(value: Any, values: Tuple[str, ...]) -> Any:
     return value
 
 
+# A record is not a log line.  The text policy masks any configured value from
+# four characters up, because a log line is disposable, but the durable record
+# holds the creator's own words -- the transcript, the captions, the clip
+# titles.  Rewriting those because an operator configured a short, ordinary
+# secret would silently corrupt the work itself, so the record owner only
+# rewrites a value long enough to actually be a credential.
+_RECORD_SECRET_MIN_LENGTH = 12
+
+
 def redact_record_secrets(record: Any, secrets: Optional[Dict[str, str]] = None) -> None:
     """Replace known credential values anywhere inside a record, in place.
 
@@ -214,11 +223,11 @@ def redact_record_secrets(record: Any, secrets: Optional[Dict[str, str]] = None)
     narrates or echoes back the request it just rejected, or a provider payload
     that lands in a result field.  The durable write path is the single owner of
     what a record may contain, so it scrubs those values as well and no field
-    added later can leak by omission.  Only values the policy already knows are
-    credentials are replaced, so functional text is left byte-for-byte
-    unchanged.
+    added later can leak by omission.  Only a credential-shaped value the policy
+    already knows is replaced, so functional and creator-authored text is left
+    byte-for-byte unchanged.
     """
-    values = _secret_values(secrets)
+    values = tuple(value for value in _secret_values(secrets) if len(value) >= _RECORD_SECRET_MIN_LENGTH)
     if not values:
         return
     _redact_record_secrets_in(record, values)
