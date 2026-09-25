@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import math
 import os
 import threading
 import time
+import tracemalloc
 import zipfile
 from types import SimpleNamespace
 
@@ -15,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import web.app as studio
+from web.feature_routes import backup_projects
 
 
 @pytest.fixture()
@@ -351,6 +354,59 @@ def test_legacy_one_level_undo_snapshot_is_migrated(client: TestClient, monkeypa
     assert short["title"] == "Original"
     assert short["history_depth"] == 0
     assert short["redo_depth"] == 1
+
+
+def test_media_backup_spools_the_archive_instead_of_buffering_it(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A media backup can hold 512 MB, so it must not hold the archive in RAM.
+
+    The route function is measured directly because the response body is
+    produced by the transport; collecting it here would measure this test's own
+    buffer instead.
+    """
+    monkeypatch.setattr(studio, "_min_free_gb", 0)
+    monkeypatch.setattr(studio, "_allow_external_paths", True)
+    media_root = tmp_path / "spool-media"
+    media_root.mkdir(parents=True, exist_ok=True)
+    media_size = 32 * 1024 * 1024
+    clip = media_root / "clip.mp4"
+    clip.write_bytes(os.urandom(media_size))
+    with studio._lock:
+        studio._jobs["spool-source"] = {
+            "id": "spool-source",
+            "name": "Spool source",
+            "status": "done",
+            "request": {"url": "source.mp4"},
+            "raw_shorts": [{"title": "Clip", "clip_url": str(clip)}],
+            "logs": [],
+            "created_at": time.time(),
+            "output_dir": str(media_root),
+        }
+        studio._persist_job_locked(studio._jobs["spool-source"])
+
+    tracemalloc.start()
+    try:
+        response = backup_projects(include_media=True)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    # Building the archive must stay far below the media it is zipping, or one
+    # request per client multiplies the whole library through memory.
+    assert peak < media_size // 2, f"backup buffered {peak / 1024 / 1024:.1f} MB for {media_size / 1024 / 1024:.0f} MB"
+
+    # The spooled archive is still a complete backup, streamed in chunks.
+    async def drain() -> list[bytes]:
+        return [chunk async for chunk in response.body_iterator]
+
+    chunks = asyncio.run(drain())
+    assert len(chunks) > 1
+    body = b"".join(chunks)
+    assert len(body) >= media_size
+    with zipfile.ZipFile(io.BytesIO(body)) as archive:
+        assert archive.read("media/spool-source/clip.mp4") == clip.read_bytes()
+        assert "media_manifest.json" in archive.namelist()
 
 
 def test_backup_restore_and_storage_cleanup_are_scoped(

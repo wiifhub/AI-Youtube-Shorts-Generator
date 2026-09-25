@@ -14,11 +14,12 @@ import asyncio
 import json
 import hashlib
 import shutil
+import tempfile
 import time
 import zipfile
 import requests
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
@@ -272,6 +273,23 @@ def cleanup_storage(request: CleanupRequest) -> Dict[str, Any]:
     }
 
 
+def _stream_archive(stream: Any, chunk_size: int = 1024 * 1024) -> Iterator[bytes]:
+    """Yield a spooled archive in bounded chunks and close it when done.
+
+    The chunked reader is deliberate: iterating a binary file splits on
+    newlines, and a media archive can contain none, which would hand the whole
+    buffer to the transport in one piece.
+    """
+    try:
+        while True:
+            chunk = stream.read(chunk_size)
+            if not chunk:
+                return
+            yield chunk
+    finally:
+        stream.close()
+
+
 @router.get("/backup", tags=["system"])
 def backup_projects(include_media: bool = Query(default=False)) -> StreamingResponse:
     """Download project metadata/settings, optionally with job-owned media."""
@@ -353,7 +371,11 @@ def backup_projects(include_media: bool = Query(default=False)) -> StreamingResp
                         if media_bytes > max_media_bytes:
                             raise HTTPException(413, "media backup exceeds the 512 MB safety limit")
                         media_files.append((f"media/{job_id}/{relative.as_posix()}", media_path, size))
-    archive = io.BytesIO()
+    # A media backup holds up to 512 MB of job-owned media, so it is spooled
+    # like the per-project export instead of buffering the finished archive in
+    # memory: the safety limit above bounds one request's media, and this keeps
+    # concurrent requests from multiplying it in RAM.
+    archive = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
         bundle.writestr(
             "backup.json",
@@ -388,7 +410,7 @@ def backup_projects(include_media: bool = Query(default=False)) -> StreamingResp
             )
     archive.seek(0)
     return StreamingResponse(
-        archive,
+        _stream_archive(archive),
         media_type="application/zip",
         headers={"Content-Disposition": 'attachment; filename="shorts_studio_backup.zip"'},
     )
