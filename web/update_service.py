@@ -21,6 +21,18 @@ from urllib.parse import urlparse
 
 
 class UpdateService:
+    #: Hosts allowed to serve a release asset.  GitHub answers a release download
+    #: with a redirect to one of its own asset hosts, so the policy has to hold
+    #: for the URL the bytes actually came from as well as the one requested --
+    #: otherwise an approved name can hand over bytes from anywhere.
+    _APPROVED_ASSET_HOSTS = frozenset(
+        {
+            "github.com",
+            "objects.githubusercontent.com",
+            "release-assets.githubusercontent.com",
+        }
+    )
+
     def __init__(
         self,
         *,
@@ -39,6 +51,12 @@ class UpdateService:
         self.get_state = state_getter
         self.max_bytes = max(1, int(max_bytes))
         self.require_digest = bool(require_digest)
+
+    @classmethod
+    def _approved_asset_url(cls, url: Any) -> bool:
+        """True when ``url`` is an approved GitHub HTTPS asset location."""
+        parsed = urlparse(str(url or ""))
+        return parsed.scheme == "https" and parsed.hostname in cls._APPROVED_ASSET_HOSTS
 
     @staticmethod
     def version_tuple(value: Any) -> tuple[int, int, int]:
@@ -192,12 +210,7 @@ try {{
 
         partial: Optional[Path] = None
         try:
-            parsed_url = urlparse(str(asset.get("url") or ""))
-            if parsed_url.scheme != "https" or parsed_url.hostname not in {
-                "github.com",
-                "objects.githubusercontent.com",
-                "release-assets.githubusercontent.com",
-            }:
+            if not self._approved_asset_url(asset.get("url")):
                 raise RuntimeError("update asset URL is not an approved GitHub HTTPS host")
             target_dir = self.update_dir()
             target_dir.mkdir(parents=True, exist_ok=True)
@@ -207,6 +220,10 @@ try {{
             self.set_state(status="downloading", latest_version=latest, asset_name=filename, progress=0, total=0, message=f"Downloading {filename}", error=None)
             with requests.get(asset["url"], headers={"Accept": "application/octet-stream", "User-Agent": "ShortsStudio-Updater"}, stream=True, timeout=(15, 120)) as response:
                 response.raise_for_status()
+                # Redirects are followed, so the request clearing the check above
+                # says nothing about where these bytes came from.
+                if not self._approved_asset_url(getattr(response, "url", None)):
+                    raise RuntimeError("update download was redirected outside the approved GitHub hosts")
                 total = int(response.headers.get("content-length") or 0)
                 if total > self.max_bytes:
                     raise RuntimeError("update asset exceeds the configured size limit")
