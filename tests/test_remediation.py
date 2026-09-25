@@ -17,7 +17,14 @@ from fastapi.testclient import TestClient
 
 import web.app as studio
 from web import feature_routes
-from web.security import SlidingWindowLimiter, issue_session_token, redact_text, redact_url_query, verify_session_token
+from web.security import (
+    SlidingWindowLimiter,
+    issue_session_token,
+    redact_record_urls,
+    redact_text,
+    redact_url_query,
+    verify_session_token,
+)
 
 
 @pytest.fixture()
@@ -55,6 +62,30 @@ def test_redact_text_strips_credential_query_parameters() -> None:
     assert "SUPERSECRET" not in result
     assert "client_secret" not in result
     assert "code=abc" in result
+
+
+def test_record_url_scrub_covers_every_field_without_rewriting_prose() -> None:
+    """The durable write walks the whole record, but only whole-string URLs."""
+    record = {
+        "request": {"url": "https://cdn.example/video.mp4?key=abc123"},
+        "raw_source_video_url": "https://b.s3.amazonaws.com/v.mp4?X-Amz-Signature=deadbeefcafe",
+        "result": {
+            "source_video_url": "https://x.example/cb#access_token=FRAGSECRET",
+            "shorts": [{"play_url": "/api/jobs/1/clip/0", "note": "see https://docs.example/a b for help"}],
+        },
+        "tuple_url": ("https://x.example/o?access_token=TUPLESECRET",),
+    }
+
+    assert redact_record_urls(record) is True
+    assert "deadbeefcafe" not in json.dumps(record)
+    assert "FRAGSECRET" not in json.dumps(record)
+    assert "TUPLESECRET" not in json.dumps(record)
+    # Functional parameters survive, and prose is not treated as a URL.
+    assert record["request"]["url"] == "https://cdn.example/video.mp4?key=abc123"
+    assert record["result"]["shorts"][0]["note"] == "see https://docs.example/a b for help"
+
+    # A record with nothing to strip reports no change, so nothing is flagged.
+    assert redact_record_urls({"request": {"url": "https://cdn.example/v.mp4?key=abc"}}) is False
 
 
 def test_redact_url_query_is_case_insensitive_and_recursive() -> None:
@@ -820,6 +851,87 @@ def test_provider_query_credentials_are_stripped_from_every_saved_copy(
     mirror = (studio._jobs_dir / f"{job_id}.json").read_text(encoding="utf-8")
     for secret in secrets:
         assert secret not in mirror
+
+
+def test_completed_render_leaves_no_credential_in_any_persisted_field(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drives the real completion path, which stores its own source URL.
+
+    Every other URL test asserts against a record the enqueue path built, which
+    is why the completion fields could leak unnoticed: after the pipeline hands
+    back the URL it was given, the worker stores that value in
+    ``raw_source_video_url`` and inside ``result``, so scrubbing only the
+    request URL leaves a credential on disk.
+    """
+    monkeypatch.setattr(studio, "MUAPI_API_KEY", "mu_test_key_1234567890")
+    signed = f"https://customer-abc.cloudflarestream.com/{_STREAM_TOKEN}/manifest/video.m3u8"
+    scrubbed = "https://customer-abc.cloudflarestream.com/manifest/video.m3u8"
+    handed: dict = {}
+    monkeypatch.setattr(
+        studio,
+        "_start_job_thread",
+        lambda job_id, req, *args, **kwargs: handed.__setitem__(job_id, req),
+    )
+    # The API-mode pipeline echoes back the URL it was handed, as it does live.
+    monkeypatch.setattr(
+        studio,
+        "generate_shorts",
+        lambda **kwargs: {
+            "mode": "api",
+            "source_video_url": kwargs["youtube_url"],
+            "transcript": {},
+            "highlights": [],
+            "shorts": [],
+            "llm": {},
+        },
+    )
+
+    response = client.post("/api/jobs", json={"url": signed, "mode": "api"})
+    assert response.status_code == 200
+    job_id = response.json()["id"]
+
+    # The downloader must still be handed the URL exactly as supplied.
+    assert handed[job_id].url == signed
+    studio._run_job(job_id, handed[job_id], None)
+
+    with studio._lock:
+        job = studio._jobs[job_id]
+        assert job["status"] == "done"
+        assert job["source_url_redacted"] is True
+        assert job["request"]["url"] == scrubbed
+        # The field the completion path adds, and its twin inside the result.
+        assert job["raw_source_video_url"] == scrubbed
+        assert job["result"]["source_video_url"] == scrubbed
+
+    # Every durable artifact this path produces: the portable mirror, the
+    # manifest beside the rendered media, and anything added later that lands
+    # under the job directory.
+    artifacts = sorted(path for path in studio._jobs_dir.rglob("*") if path.is_file())
+    assert (studio._jobs_dir / f"{job_id}.json") in artifacts
+    assert (studio._jobs_dir / job_id / "metadata.json") in artifacts
+    for path in artifacts:
+        assert _STREAM_TOKEN not in path.read_text(encoding="utf-8", errors="ignore"), f"token in {path}"
+    database = studio._jobs_db_path
+    for path in (database, database.with_name(database.name + "-wal")):
+        if path.is_file():
+            assert _STREAM_TOKEN.encode() not in path.read_bytes(), f"token in {path}"
+
+    # A downloaded copy must not carry it either.
+    export = client.get(f"/api/v1/jobs/{job_id}/export")
+    assert export.status_code == 200
+    assert _STREAM_TOKEN.encode() not in export.content
+
+    # The flagged record must refuse to fetch its stripped address again.
+    with studio._lock:
+        studio._jobs[job_id]["status"] = "interrupted"
+        studio._persist_job_locked(studio._jobs[job_id])
+    studio._resume_interrupted_jobs()
+    with studio._lock:
+        assert studio._jobs[job_id]["status"] == "error"
+        assert "credentials" in str(studio._jobs[job_id]["message"])
+    retry = client.post(f"/api/jobs/{job_id}/retry")
+    assert retry.status_code == 409
 
 
 @pytest.mark.parametrize(

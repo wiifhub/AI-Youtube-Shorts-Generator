@@ -81,6 +81,7 @@ from web.security import (  # noqa: E402
     make_rate_limiter,
     rate_limit_key,
     rate_limit_response,
+    redact_record_urls,
     redact_structure,
     redact_text,
     redact_url_query,
@@ -655,26 +656,24 @@ def _job_path(job_id: str) -> Path:
 def _persist_job_locked(job: Dict[str, Any]) -> None:
     """Persist one job atomically to SQLite and a portable JSON mirror.
 
-    Request URLs are scrubbed of credential-looking query parameters before
-    anything touches disk: signed media links and OAuth values have no
-    business outliving the request that produced them.  SQLite is the durable
-    queue/state source.  JSON remains intentionally
-    available for human inspection and the metadata backup format.
+    Every URL-bearing field is scrubbed before anything touches disk, not just
+    the request URL: signed media links and OAuth values have no business
+    outliving the request that produced them, and a field the policy owner was
+    never told about cannot leak by omission.  SQLite is the durable
+    queue/state source.  JSON remains intentionally available for human
+    inspection and the metadata backup format.
     """
     _jobs_dir.mkdir(parents=True, exist_ok=True)
     _job_store.reopen()
     job["schema_version"] = _JOB_SCHEMA_VERSION
     job["updated_at"] = time.time()
-    request_value = job.get("request")
-    if isinstance(request_value, dict):
-        url_value = request_value.get("url")
-        if isinstance(url_value, str) and "://" in url_value:
-            safe_url = redact_url_query(url_value)
-            if safe_url != url_value:
-                request_value["url"] = safe_url
-                # Whatever stripped the credentials, the URL can no longer be
-                # fetched: flag it so resume and retry refuse the stripped form.
-                job["source_url_redacted"] = True
+    # One owner for the durable record: scrub every URL-bearing field here
+    # rather than at each call site, so the completion path's own source field
+    # and any field added later are covered by the same policy.  Whatever
+    # stripped a credential, the stored source can no longer be fetched, so the
+    # record is flagged and resume/retry refuse the stripped address.
+    if redact_record_urls(job):
+        job["source_url_redacted"] = True
     _job_store.save(job)
     path = _job_path(str(job["id"]))
     temporary = path.with_suffix(".json.tmp")
@@ -1588,6 +1587,11 @@ def _run_job(
                 "result": public,
                 "transcript": transcript,
             }
+            # A portable manifest is a durable artifact like the record itself,
+            # and it is written before the record is scrubbed, so it goes
+            # through the same URL policy instead of trusting the pipeline's
+            # echo of the source URL.
+            redact_record_urls(metadata)
             (job_output_dir / "metadata.json").write_text(
                 json.dumps(metadata, ensure_ascii=False, indent=2, default=str),
                 encoding="utf-8",
