@@ -491,10 +491,19 @@ def _has_caption_window(clip_start: float, clip_end: float, segments: Optional[L
 
 
 def _escape_filter_path(path: str) -> str:
-    """Escape a Windows/Unix path for ffmpeg's subtitles filter."""
-    # The filter parser wants forward slashes and an escaped drive-letter
-    # colon. The surrounding single quotes keep spaces in paths intact.
-    return str(Path(path).resolve()).replace("\\", "/").replace(":", r"\:")
+    """Escape a filesystem path for FFmpeg's filtergraph option syntax.
+
+    FFmpeg unescapes a filter argument twice: the filtergraph parser splits
+    filters/chains first, then the filter's own option parser splits
+    ``key=value`` pairs.  A path must survive both levels, so escaping only once
+    (or wrapping the value in single quotes) makes FFmpeg drop or mis-parse an
+    apostrophe and then fail to open the subtitle file.
+    """
+    text = str(Path(path).resolve()).replace("\\", "/")
+    # Level 2: the filter's own option parser escapes ':', '\\' and "'."
+    text = text.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+    # Level 1: the filtergraph parser also splits on ',' ';' '[' and ']'.
+    return "".join(f"\\{character}" if character in "\\',;[]" else character for character in text)
 
 
 def _burn_in_captions(
@@ -530,7 +539,7 @@ def _burn_in_captions(
             return False
 
         ffmpeg = _find_ffmpeg()
-        subtitle_file = _escape_filter_path(ass_path).replace("'", r"\'")
+        subtitle_file = _escape_filter_path(ass_path)
         cmd = [
             ffmpeg,
             "-y",
@@ -539,7 +548,7 @@ def _burn_in_captions(
             "-i",
             video_path,
             "-vf",
-            f"subtitles=filename='{subtitle_file}'",
+            f"subtitles=filename={subtitle_file}",
             "-c:v",
             "libx264",
             "-preset",

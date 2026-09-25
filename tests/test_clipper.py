@@ -163,3 +163,101 @@ def test_multicut_media_duration_is_compacted_before_render(tmp_path: Path) -> N
     )
     duration = float(probe.stdout.strip())
     assert 1.5 <= duration <= 2.5
+
+
+def _ffmpeg_unescape_once(text: str) -> str:
+    """Mirror FFmpeg's filter quoting/escaping for a single parser level."""
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character == "\\" and index + 1 < len(text):
+            out.append(text[index + 1])
+            index += 2
+        elif character == "'":
+            index += 1
+        else:
+            out.append(character)
+            index += 1
+    return "".join(out)
+
+
+@pytest.mark.parametrize(
+    "dirname",
+    ["plain", "space dir", "Bob's Videos", "a,b;c[d]e'f", "out'[1]hflip[v];[v]'", "x',negate'"],
+)
+def test_caption_filter_filename_survives_both_ffmpeg_parsing_levels(
+    monkeypatch, tmp_path: Path, dirname: str
+) -> None:
+    """A hostile render path must reach FFmpeg intact, not split into filters.
+
+    FFmpeg unescapes a filter argument twice, so a single level of escaping lets
+    an apostrophe in the save folder truncate the subtitle path, drop the file,
+    or leak the rest of the path into the filtergraph as filter syntax.
+    """
+    commands: list[list[str]] = []
+
+    def capture(args, **_kwargs):
+        commands.append([str(item) for item in args])
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(clipper, "_run_command", capture)
+    output_dir = tmp_path / dirname
+    output_dir.mkdir(parents=True)
+    source = output_dir / "source.mp4"
+    source.write_bytes(b"source")
+    out_path = output_dir / "short_01.mp4"
+
+    assert clipper._burn_in_captions(
+        str(source),
+        0.0,
+        1.0,
+        [{"start": 0.0, "end": 1.0, "text": "hello world"}],
+        str(out_path),
+    )
+
+    filters = commands[0]
+    value = filters[filters.index("-vf") + 1]
+    assert value.startswith("subtitles=filename=")
+    escaped = value[len("subtitles=filename=") :]
+    expected = str(Path(str(out_path) + ".ass").resolve()).replace("\\", "/")
+    # Two unescapes model FFmpeg's filtergraph + filter-option parsers.
+    assert _ffmpeg_unescape_once(_ffmpeg_unescape_once(escaped)) == expected
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required for media regression")
+def test_captions_render_through_a_folder_name_with_an_apostrophe(tmp_path: Path) -> None:
+    folder = tmp_path / "Bob's Videos"
+    folder.mkdir()
+    source = folder / "source.mp4"
+    output = folder / "short_01.mp4"
+    subprocess.run(
+        [
+            shutil.which("ffmpeg") or "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=320x568:rate=24",
+            "-t",
+            "1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    assert clipper._burn_in_captions(
+        str(source),
+        0.0,
+        0.8,
+        [{"start": 0.0, "end": 0.8, "text": "hello world"}],
+        str(output),
+    )
+    assert output.is_file() and output.stat().st_size > 0
