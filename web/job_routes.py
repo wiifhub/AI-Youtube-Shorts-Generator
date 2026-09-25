@@ -372,6 +372,12 @@ def retry_job(
         job = studio._jobs.get(job_id)
         if not job:
             raise HTTPException(404, "job not found")
+        # The eligibility test above ran without the lock, so re-check it while
+        # committing the transition. Otherwise two concurrent retries both pass
+        # that test and start two renders for one id, racing on its output files,
+        # logs and record.
+        if str(job.get("status") or "unknown") not in {"error", "cancelled", "interrupted", "draft"}:
+            raise HTTPException(409, "project is already running")
         job["status"] = "running"
         job["stage"] = "queued"
         job["message"] = "Queued for retry"

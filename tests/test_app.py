@@ -730,3 +730,93 @@ def test_project_library_supports_more_than_twenty_records_and_search(client: Te
     search = client.get("/api/jobs", params={"q": "library-pagination-17", "limit": 100})
     assert search.status_code == 200
     assert [job["id"] for job in search.json()["jobs"]] == ["library-page-17"]
+
+
+def test_concurrent_retries_start_only_one_render_per_project(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Racing retries for one id must not start two renders for it.
+
+    The route validates the status without the lock and commits the transition
+    later, so without a re-check every racer starts its own render for the same
+    project, racing on its output files, logs and record.
+    """
+    from fastapi import HTTPException
+
+    from web import job_routes
+
+    job_id = "retry-race-job"
+    source = studio._output_root / "retry-race-source.mp4"
+    source.write_bytes(b"fixture")
+    with studio._lock:
+        studio._jobs[job_id] = {
+            "id": job_id,
+            "name": "Retry race",
+            "status": "error",
+            "stage": "error",
+            "message": "boom",
+            "error": "boom",
+            "progress": 0,
+            "logs": [],
+            "result": None,
+            "raw_shorts": [],
+            "raw_transcript": {},
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "archived": False,
+            "source_url_redacted": False,
+            "request": {"url": str(source), "mode": "local"},
+        }
+        studio._persist_job_locked(studio._jobs[job_id])
+
+    racers = 6
+    # Hold every racer inside the between-locks region so all of them clear the
+    # first status check before any of them commits the transition.
+    gate = threading.Barrier(racers)
+    original_validate = studio._validate_local_paths
+
+    def gated_validate(request):
+        gate.wait(timeout=15)
+        return original_validate(request)
+
+    monkeypatch.setattr(studio, "_validate_local_paths", gated_validate)
+
+    renders = []
+
+    def fake_generate_shorts(**_kwargs):
+        renders.append(threading.get_ident())
+        time.sleep(0.05)
+        return {
+            "mode": "local",
+            "source_video_url": None,
+            "highlights": [],
+            "shorts": [],
+            "transcript": {"segments": []},
+            "llm": {},
+        }
+
+    monkeypatch.setattr(studio, "generate_shorts", fake_generate_shorts)
+
+    outcomes: list[int] = []
+    outcomes_lock = threading.Lock()
+
+    def retry() -> None:
+        try:
+            job_routes.retry_job(job_id, None, None, None, None)
+            outcome = 200
+        except HTTPException as exc:
+            outcome = int(exc.status_code)
+        with outcomes_lock:
+            outcomes.append(outcome)
+
+    threads = [threading.Thread(target=retry) for _ in range(racers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not renders:
+        time.sleep(0.05)
+    time.sleep(0.2)
+
+    assert sorted(outcomes) == [200] + [409] * (racers - 1)
+    assert len(renders) == 1
