@@ -71,26 +71,53 @@ def _scrub_parameters(component: str) -> str:
     return urlencode(kept)
 
 
+# Some providers sign the *path* instead of the query, putting the credential
+# where the public video id normally sits: Cloudflare Stream serves
+# ``customer-<code>.cloudflarestream.com/<TOKEN>/manifest/video.m3u8``,
+# ``/<TOKEN>/iframe`` and ``/<TOKEN>/downloads/default.mp4``.  That token is a
+# JWS compact serialization -- three base64url segments whose header decodes to
+# a JSON object, hence the ``eyJ`` prefix -- which is a structural signature
+# rather than an entropy guess: a functional segment (a video id, a ``manifest``
+# route, a filename) never has that shape, so an unrecognised host keeps its
+# path byte-for-byte.  The downloader is never handed the scrubbed form; only
+# the durable copy loses the token, and that record is flagged so resume and
+# retry refuse it rather than fetching a mangled address.
+_JWT_SEGMENT_PATTERN = re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{16,}")
+
+
+def _scrub_path(path: str) -> str:
+    """Drop credential-shaped path segments, keeping the rest of the path."""
+    if "." not in path:
+        return path
+    segments = path.split("/")
+    kept = [segment for segment in segments if not _JWT_SEGMENT_PATTERN.fullmatch(segment)]
+    if len(kept) == len(segments):
+        return path
+    return "/".join(kept)
+
+
 def redact_url_query(value: str) -> str:
-    """Strip credential parameters from a URL's query *and* fragment.
+    """Strip credentials from a URL's query, fragment *and* signed path.
 
     Long signed-URL parameters (S3, Azure, GCS, OAuth) routinely outlive the
-    request that produced them, and implicit-flow tokens live in the fragment,
-    so anything surviving in a persisted job record, a backup, or an API error
-    message must not carry those values.  Non-credential parameters -- and a
-    URL with no credential parameters at all -- are returned byte-for-byte
-    unchanged so a legitimate source URL keeps working.
+    request that produced them, implicit-flow tokens live in the fragment, and
+    path-signing providers carry the token in place of the video id, so anything
+    surviving in a persisted job record, a backup, or an API error message must
+    not carry those values.  Non-credential parameters and path segments -- and
+    a URL with no credentials at all -- are returned byte-for-byte unchanged so
+    a legitimate source URL keeps working.
     """
     text = str(value or "")
     try:
         parts = urlsplit(text)
     except (TypeError, ValueError):
         return ""
+    path = _scrub_path(parts.path)
     query = _scrub_parameters(parts.query)
     fragment = _scrub_parameters(parts.fragment)
-    if query == parts.query and fragment == parts.fragment:
+    if path == parts.path and query == parts.query and fragment == parts.fragment:
         return text
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, fragment))
+    return urlunsplit((parts.scheme, parts.netloc, path, query, fragment))
 
 
 def _redact_query_parameters(text: str) -> str:

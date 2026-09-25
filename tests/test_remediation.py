@@ -77,12 +77,17 @@ def test_backup_helper_scrubs_signed_and_secret_params() -> None:
         {
             "nested": "https://cdn.example/file.mp4?X-Amz-Signature=sigvalue&Client_Secret=sec&Expires=900&id=42",
             "plain": "https://www.youtube.com/watch?v=abc",
+            "stream": (
+                f"https://customer-abc.cloudflarestream.com/{_STREAM_TOKEN}/manifest/video.m3u8"
+            ),
         }
     )
     assert "sigvalue" not in value["nested"]
     assert "sec" not in value["nested"]
     assert "id=42" in value["nested"]
     assert value["plain"] == "https://www.youtube.com/watch?v=abc"
+    assert _STREAM_TOKEN not in value["stream"]
+    assert value["stream"].endswith("/manifest/video.m3u8")
 
 
 # ---------------------------------------------------------------------------
@@ -558,16 +563,32 @@ def test_query_secret_matching_is_whole_name_only() -> None:
     assert redact_text("open https://cdn.example/v.mp4?key=abc&author=bob").endswith("?key=abc&author=bob")
 
 
+# A Cloudflare Stream signed URL keeps the token where the public video id sits
+# (docs: customer-<CODE>.cloudflarestream.com/<TOKEN>/manifest/video.m3u8,
+# /<TOKEN>/iframe).  The token is always a JWS compact serialization: three
+# base64url segments whose header decodes to a JSON object.
+_STREAM_TOKEN = (
+    "eyJhbGciOiJSUzI1NiIsImtpZCI6ImFiY2RlZjEyMzQ1NiJ9"
+    ".eyJzdWIiOiJ2aWRlbyIsImV4cCI6MTc1MDAwMDAwMH0"
+    ".c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmUtc2lnbmF0dXJl"
+)
+
 # Realistic source URLs whose parameters *look* credential-ish but are part of
 # how the source is fetched.  Each one is a shape an over-broad rule already
 # broke once: ``si``/``t``/``list`` are share and seek parameters, ``size`` is a
-# rendition hint, and a self-hosted ``key`` is an application-level accessor.
+# rendition hint, a self-hosted ``key`` is an application-level accessor, and the
+# 32-character id in a public Stream URL is a video id, not a token.
 _FUNCTIONAL_SOURCE_URLS = (
     pytest.param("https://www.youtube.com/watch?v=aBcD1234&si=SHARE_TOKEN&t=60", id="youtube-share"),
     pytest.param("https://youtu.be/aBcD1234?si=SHARE&list=PL123&size=large", id="youtube-playlist"),
     pytest.param("https://vimeo.com/123456789?share=copy&size=large", id="vimeo-share"),
     pytest.param("https://vimeo.com/123456789#t=60", id="vimeo-time-fragment"),
     pytest.param("https://self-hosted.example/media/clip.mp4?key=abc123&author=bob", id="self-hosted-key"),
+    pytest.param(
+        "https://customer-abc.cloudflarestream.com/ea95132c15732412d22c1476fa83f27a/manifest/video.m3u8",
+        id="stream-public-video-id",
+    ),
+    pytest.param("https://cdn.example/a1b2c3d4e5f6a7b8c9d0/manifest/video.m3u8", id="opaque-path-segment"),
 )
 
 # The same download shapes carrying a real credential: the renderer must still
@@ -605,6 +626,12 @@ _CREDENTIAL_SOURCE_URLS = (
         "https://self-hosted.example/media/clip.mp4?key=abc123&viewer=bob",
         ("X-Amz-Signature", "deadbeefcafe"),
         id="self-hosted-key-plus-signature",
+    ),
+    pytest.param(
+        f"https://customer-abc.cloudflarestream.com/{_STREAM_TOKEN}/manifest/video.m3u8",
+        "https://customer-abc.cloudflarestream.com/manifest/video.m3u8",
+        (_STREAM_TOKEN,),
+        id="stream-signed-path-token",
     ),
 )
 
@@ -663,6 +690,28 @@ def test_realistic_signed_source_urls_lose_credentials_in_every_saved_copy(
     assert stored == persisted
     assert persisted in returned
     assert json.dumps(persisted)[1:-1] in mirror
+
+
+def test_signed_path_tokens_are_scrubbed_by_shape_only() -> None:
+    """A path-signing provider loses its token; every other path is left alone."""
+    host = "https://customer-abc.cloudflarestream.com"
+    assert redact_url_query(f"{host}/{_STREAM_TOKEN}/manifest/video.m3u8") == f"{host}/manifest/video.m3u8"
+    assert redact_url_query(f"{host}/{_STREAM_TOKEN}/iframe") == f"{host}/iframe"
+    # The route survives next to the stripped token, and an expiry is not a
+    # credential on its own, so ``exp`` stays.
+    downloads = redact_url_query(f"{host}/{_STREAM_TOKEN}/downloads/default.mp4?exp=1750000000")
+    assert downloads == f"{host}/downloads/default.mp4?exp=1750000000"
+
+    # A public Stream URL puts the video id in the same position: not a credential.
+    public = f"{host}/ea95132c15732412d22c1476fa83f27a/manifest/video.m3u8"
+    assert redact_url_query(public) == public
+    # An opaque-looking segment on an unrecognised host is still a path.
+    unknown = "https://cdn.example/a1b2c3d4e5f6a7b8c9d0/manifest/video.m3u8"
+    assert redact_url_query(unknown) == unknown
+
+    assert _STREAM_TOKEN not in redact_text(f"GET {host}/{_STREAM_TOKEN}/manifest/video.m3u8 failed")
+    scrubbed = redact_url_query(f"{host}/{_STREAM_TOKEN}/manifest/video.m3u8")
+    assert redact_url_query(scrubbed) == scrubbed
 
 
 def test_factory_manifest_source_reads_the_shared_credential_policy(
@@ -773,15 +822,22 @@ def test_provider_query_credentials_are_stripped_from_every_saved_copy(
         assert secret not in mirror
 
 
+@pytest.mark.parametrize(
+    "url",
+    (
+        pytest.param("https://cdn.example/video.mp4?access_token=LEAKEDSECRET", id="query-credential"),
+        pytest.param(
+            f"https://customer-abc.cloudflarestream.com/{_STREAM_TOKEN}/manifest/video.m3u8",
+            id="signed-path-token",
+        ),
+    ),
+)
 def test_redacted_source_url_is_never_reused_for_resume_or_retry(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, url: str
 ) -> None:
     monkeypatch.setattr(studio, "MUAPI_API_KEY", "mu_test_key_1234567890")
     _capture_started(monkeypatch)
-    response = client.post(
-        "/api/jobs",
-        json={"url": "https://cdn.example/video.mp4?access_token=LEAKEDSECRET", "mode": "api"},
-    )
+    response = client.post("/api/jobs", json={"url": url, "mode": "api"})
     assert response.status_code == 200
     job_id = response.json()["id"]
 
