@@ -59,6 +59,34 @@ def _query_key_is_secret(name: str) -> bool:
     return folded in _SECRET_QUERY_NAMES or folded.startswith(_SECRET_QUERY_PREFIXES)
 
 
+# RFC 3986 allows credentials in the authority, which is how a self-hosted
+# media server or a signed direct-download link carries basic auth.  A bare
+# username is not a credential, and removing it would rewrite a URL that still
+# has to be fetched, so only ``user:password@`` is dropped.
+_USERINFO_PATTERN = re.compile(r"(?i)\b([A-Za-z][A-Za-z0-9+.\-]*://)([^/?#\s@]*:[^/?#\s@]*)@")
+
+
+def _scrub_userinfo(netloc: str) -> str:
+    """Drop ``user:password@`` credentials from a URL authority."""
+    if "@" not in netloc:
+        return netloc
+    userinfo, host = netloc.rsplit("@", 1)
+    return host if ":" in userinfo else netloc
+
+
+def _redact_userinfo(text: str) -> str:
+    """Replace ``scheme://user:password@`` inside free text with a marker.
+
+    A log line or an upstream error quotes the address it failed on, so the
+    authority credential is scrubbed in prose as well as in a whole URL.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        return f"{match.group(1)}[redacted]@"
+
+    return _USERINFO_PATTERN.sub(replace, text)
+
+
 def _scrub_parameters(component: str) -> str:
     """Drop credential parameters from a query or fragment, keeping the rest."""
     if not component or "=" not in component:
@@ -115,9 +143,10 @@ def redact_url_query(value: str) -> str:
     path = _scrub_path(parts.path)
     query = _scrub_parameters(parts.query)
     fragment = _scrub_parameters(parts.fragment)
-    if path == parts.path and query == parts.query and fragment == parts.fragment:
+    netloc = _scrub_userinfo(parts.netloc)
+    if path == parts.path and query == parts.query and fragment == parts.fragment and netloc == parts.netloc:
         return text
-    return urlunsplit((parts.scheme, parts.netloc, path, query, fragment))
+    return urlunsplit((parts.scheme, netloc, path, query, fragment))
 
 
 # A durable record can hold a URL in any field, and neither a field added later
@@ -187,6 +216,7 @@ def redact_text(value: Any, secrets: Optional[Dict[str, str]] = None, max_length
     if "://" in text:
         text = redact_url_query(text)
     text = _redact_query_parameters(text)
+    text = _redact_userinfo(text)
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub("[redacted]", text)
     explicit = tuple(value for value in (secrets or {}).values() if isinstance(value, str))

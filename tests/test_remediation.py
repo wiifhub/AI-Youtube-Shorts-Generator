@@ -8,9 +8,11 @@ and the fail-closed remote-bind startup guard.
 
 from __future__ import annotations
 
+import io
 import json
 import threading
 import time
+import zipfile
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1188,3 +1190,138 @@ def test_flagged_record_refusal_wording_is_unchanged(
     assert returned.json()["error"] == _PINNED_SOURCE_URL_REDACTED_MESSAGE
     assert returned.json()["can_retry"] is False
     assert "LEAKEDSECRET" not in json.dumps(returned.json())
+
+
+# ---------------------------------------------------------------------------
+# Credentials in the URL authority (basic-auth userinfo)
+# ---------------------------------------------------------------------------
+
+# RFC 3986 puts basic-auth credentials in the authority, which is how a
+# self-hosted media server or a signed direct-download link usually carries
+# them, so a policy that only knows query parameters and signed paths never
+# sees the secret at all.
+_BASIC_AUTH_SECRET = "SUPERSECRETBASICAUTH"
+_BASIC_AUTH_URL = f"https://alice:{_BASIC_AUTH_SECRET}@self-hosted.example/media/clip.mp4?key=abc123"
+_BASIC_AUTH_SCRUBBED = "https://self-hosted.example/media/clip.mp4?key=abc123"
+
+
+def test_basic_auth_userinfo_loses_its_credential_without_rewriting_other_urls() -> None:
+    """The credential lives in the authority, not in a query parameter."""
+    assert redact_url_query(_BASIC_AUTH_URL) == _BASIC_AUTH_SCRUBBED
+    assert _BASIC_AUTH_SECRET not in redact_text(_BASIC_AUTH_URL)
+    assert _BASIC_AUTH_SECRET not in redact_text(f"GET {_BASIC_AUTH_URL} failed")
+
+    # The durable write scrubs the whole-string URL field; a log line is prose,
+    # and the log API hands every message through ``redact_text`` when serving.
+    record = {
+        "request": {"url": _BASIC_AUTH_URL},
+        "raw_source_video_url": _BASIC_AUTH_URL,
+        "logs": [{"message": f"GET {_BASIC_AUTH_URL} failed"}],
+    }
+    redact_record_urls(record)
+    assert record["request"]["url"] == _BASIC_AUTH_SCRUBBED
+    assert record["raw_source_video_url"] == _BASIC_AUTH_SCRUBBED
+    assert _BASIC_AUTH_SECRET not in str(studio._redact_log_text(record["logs"][0]["message"]))
+
+    # A username without a password is not a credential, and a URL that has no
+    # credential keeps every byte, so scrubbing cannot break a live source.
+    for untouched in (
+        "https://viewer@self-hosted.example/media/clip.mp4",
+        "https://self-hosted.example:8443/media/clip.mp4",
+        "https://self-hosted.example/media/clip.mp4?key=abc&author=bob",
+        "https://self-hosted.example/media/clip.mp4#t=60",
+    ):
+        assert redact_url_query(untouched) == untouched
+
+
+def test_basic_auth_source_never_reaches_a_saved_or_returned_copy(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drives the real API, the durable stores, the archives and the refusal."""
+    monkeypatch.setattr(studio, "_rate_limiter", SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "_upload_rate_limiter", SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "_job_rate_limiter", SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "MUAPI_API_KEY", "mu_test_key_1234567890")
+    handed: dict = {}
+    monkeypatch.setattr(
+        studio,
+        "_start_job_thread",
+        lambda job_id, req, *args, **kwargs: handed.__setitem__(job_id, req),
+    )
+    monkeypatch.setattr(
+        studio,
+        "generate_shorts",
+        lambda **kwargs: {
+            "mode": "api",
+            "source_video_url": kwargs["youtube_url"],
+            "transcript": {},
+            "highlights": [],
+            "shorts": [],
+            "llm": {},
+        },
+    )
+
+    response = client.post("/api/jobs", json={"url": _BASIC_AUTH_URL, "mode": "api"})
+    assert response.status_code == 200
+    job_id = response.json()["id"]
+
+    # The renderer is still handed the URL that actually needs the credential.
+    assert handed[job_id].url == _BASIC_AUTH_URL
+    assert _BASIC_AUTH_SECRET not in json.dumps(response.json())
+
+    studio._run_job(job_id, handed[job_id], None)
+
+    with studio._lock:
+        job = studio._jobs[job_id]
+        assert job["status"] == "done"
+        # The stored copy keeps the functional remainder and is flagged, so a
+        # retry or resume cannot fetch the stripped address by accident.
+        assert job["request"]["url"] == _BASIC_AUTH_SCRUBBED
+        assert job["raw_source_video_url"] == _BASIC_AUTH_SCRUBBED
+        assert job["result"]["source_video_url"] == _BASIC_AUTH_SCRUBBED
+        assert job["source_url_redacted"] is True
+
+    # Every durable artifact this path produces: the portable mirror, the
+    # manifest beside the rendered media, and anything added later.
+    for path in sorted(candidate for candidate in studio._jobs_dir.rglob("*") if candidate.is_file()):
+        assert _BASIC_AUTH_SECRET not in path.read_text(encoding="utf-8", errors="ignore"), f"secret in {path}"
+    database = studio._jobs_db_path
+    for path in (database, database.with_name(database.name + "-wal")):
+        if path.is_file():
+            assert _BASIC_AUTH_SECRET.encode() not in path.read_bytes(), f"secret in {path}"
+
+    # A returned copy, the project grid, and the two archives a creator shares.
+    assert _BASIC_AUTH_SECRET not in json.dumps(client.get(f"/api/jobs/{job_id}").json())
+    assert _BASIC_AUTH_SECRET not in json.dumps(client.get(f"/api/v1/jobs/{job_id}/factory").json())
+    card = _card_payload(client, job_id)
+    assert card["source_url_redacted"] is True
+    assert card["can_retry"] is False
+    for endpoint in ("/api/backup", f"/api/v1/jobs/{job_id}/export"):
+        archive_response = client.get(endpoint)
+        assert archive_response.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(archive_response.content)) as archive:
+            for name in archive.namelist():
+                assert _BASIC_AUTH_SECRET not in archive.read(name).decode("utf-8", "ignore"), (
+                    f"secret in {endpoint}:{name}"
+                )
+
+    # The two log surfaces are prose, so the text policy has to catch a line
+    # that quotes the address it was fetching.
+    with studio._lock:
+        studio._append_job_log(studio._jobs[job_id], "download", f"fetching {_BASIC_AUTH_URL}")
+        studio._persist_job_locked(studio._jobs[job_id])
+    listing = client.get("/api/logs", params={"job_id": job_id})
+    assert listing.status_code == 200
+    assert _BASIC_AUTH_SECRET not in json.dumps(listing.json())
+    job_log = client.get(f"/api/jobs/{job_id}/logs")
+    assert job_log.status_code == 200
+    assert _BASIC_AUTH_SECRET not in job_log.text
+
+    # The credential is never replayed to fetch the stripped address again.
+    with studio._lock:
+        studio._jobs[job_id]["status"] = "interrupted"
+        studio._persist_job_locked(studio._jobs[job_id])
+    studio._resume_interrupted_jobs()
+    with studio._lock:
+        assert studio._jobs[job_id]["status"] == "error"
+    assert client.post(f"/api/jobs/{job_id}/retry").status_code == 409
