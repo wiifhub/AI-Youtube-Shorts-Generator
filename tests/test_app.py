@@ -490,6 +490,70 @@ def test_backup_restore_and_storage_cleanup_are_scoped(
     assert not preview_file.exists()
 
 
+def test_model_cache_cleanup_stays_inside_its_configured_roots(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The destructive branch may only delete below the roots it names.
+
+    Every path it resolves -- home, LOCALAPPDATA, HF_HOME, HUGGINGFACE_HUB_CACHE
+    -- is redirected into ``tmp_path`` first, and the test refuses to call the
+    endpoint at all unless every root it reports is inside that tree, so a real
+    model cache is never at risk from running the suite.
+    """
+    home = tmp_path / "home"
+    local_appdata = tmp_path / "localappdata"
+    hf_home = tmp_path / "hf-home"
+    hf_hub_cache = tmp_path / "hf-hub-cache"
+    for path in (home, local_appdata, hf_home, hf_hub_cache):
+        path.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(hf_hub_cache))
+
+    roots = studio._model_cache_roots()
+    assert roots, "expected the configured cache roots"
+    for root in roots:
+        if not str(root).startswith(str(tmp_path)):
+            pytest.skip(f"a real cache root would be cleaned: {root}")
+
+    old = time.time() - 10 * 86400
+
+    def seed(path, fresh=False):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"cached")
+        stamp = time.time() if fresh else old
+        os.utime(path, (stamp, stamp))
+        return path
+
+    stale = [
+        seed(home / ".cache" / "huggingface" / "hub" / "models--x" / "blob.bin"),
+        seed(local_appdata / "huggingface" / "hub" / "blob.bin"),
+        seed(hf_home / "blob.bin"),
+        seed(hf_hub_cache / "hub" / "blob.bin"),
+    ]
+    fresh = seed(home / ".cache" / "huggingface" / "hub" / "fresh.bin", fresh=True)
+    outsiders = [
+        seed(home / ".cache" / "other" / "keep.txt"),
+        seed(hf_home.parent / "hf-elsewhere" / "keep.txt"),
+    ]
+
+    response = client.post(
+        "/api/storage/cleanup",
+        json={"confirm": True, "older_than_days": 1, "include_model_cache": True},
+    )
+    assert response.status_code == 200
+    removed = set(response.json().get("removed") or [])
+
+    assert {str(path) for path in stale}.issubset(removed)
+    assert str(fresh) not in removed
+    for path in outsiders:
+        assert str(path) not in removed and path.is_file()
+    # The boundary itself: nothing outside the redirected tree, ever.
+    assert all(str(path).startswith(str(tmp_path)) for path in removed), sorted(removed)
+
+
 def test_transcript_brand_and_publishing_endpoints(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(studio, "_min_free_gb", 0)
     with studio._lock:
