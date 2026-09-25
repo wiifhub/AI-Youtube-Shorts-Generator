@@ -3,7 +3,7 @@
 
 #define MyAppName "Shorts Studio"
 #ifndef MyAppVersion
-#define MyAppVersion "0.11.3"
+#define MyAppVersion "1.0.1"
 #endif
 #define MyAppPublisher "wiifhub"
 #define MyAppURL "https://github.com/wiifhub/AI-Youtube-Shorts-Generator"

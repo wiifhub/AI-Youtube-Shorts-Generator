@@ -9,6 +9,34 @@ All notable Shorts Studio changes are recorded here. Dates use ISO 8601.
 - Added the latest fork comparison's related-project links for the broader
   open-source SaaS catalog and MuAPI alternatives.
 
+## [1.0.1] - 2026-09-25
+
+### Security
+
+- Scrubbed URL credentials, signed query values, basic-auth authorities, and
+  session secrets from durable jobs, backups, logs, and factory manifests.
+- Hardened authenticated deployments against loopback/host confusion, browser
+  requests that reach loopback builds, crafted job identifiers, weak secrets,
+  and update downloads that do not come from the verified release asset.
+
+### Fixed
+
+- Made upload idempotency, retry admission, render scratch files, clip
+  revisions, and cancellation run generations safe under concurrent requests.
+- Escaped hostile media paths through both FFmpeg filter parsing layers and
+  kept waveform, preview, backup, and cleanup work inside their intended
+  ownership boundaries.
+- Derived project names from creator input or the uploaded filename instead of
+  leaking a full source path into the project library.
+
+### Verification
+
+- Added focused remediation coverage for credential redaction, route-shaped
+  render budgets, path boundaries, update provenance, concurrent writes, and
+  cancellation semantics.
+- Release artifacts and the final remote CI/Docker checks are recorded after
+  the v1.0.1 tag is published.
+
 ## [1.0.0] - 2026-09-15
 
 ### Added
@@ -222,7 +250,8 @@ kept as the stable baseline for v0.10.2 work.
 - Added persistent project library, logs, previews, exports, and in-app
   update checks.
 
-[Unreleased]: https://github.com/wiifhub/AI-Youtube-Shorts-Generator/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/wiifhub/AI-Youtube-Shorts-Generator/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/wiifhub/AI-Youtube-Shorts-Generator/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/wiifhub/AI-Youtube-Shorts-Generator/compare/v0.11.3...v1.0.0
 [0.11.3]: https://github.com/wiifhub/AI-Youtube-Shorts-Generator/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/wiifhub/AI-Youtube-Shorts-Generator/compare/v0.11.1...v0.11.2

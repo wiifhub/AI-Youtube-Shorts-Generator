@@ -1,14 +1,25 @@
 # Shorts Studio TODO
 
-**Published baseline:** v1.0.0 (local and remote gates passed)
-**Current development branch:** `main` (v1.0.0 production release)
+**Published baseline:** v1.0.1 (local and remote gates passed)
+**Current development branch:** `main` (v1.0.1 production release)
 **Implementation target:** v2.0.0 (next production roadmap)
 **Beta channel:** `beta` prerelease published from the gated branch snapshot
-**Last reviewed:** 2026-09-15
+**Last reviewed:** 2026-09-25
 
 This is the canonical implementation backlog. Inline `TODO` comments should
 point to an item here; completed capabilities belong in `ROADMAP.md` rather
 than remaining as open TODOs.
+
+## v1.0.1 security and reliability follow-up (released)
+
+- [x] Scrub URL credentials, signed query values, basic-auth authorities, and
+  session secrets before durable writes, backups, exports, or log exposure.
+- [x] Harden loopback/host checks, browser-driven loopback access, crafted IDs,
+  weak-secret state mutation, and verified update-download provenance.
+- [x] Make uploads, retries, render scratch files, clip revisions, and
+  cancellation generation-safe under concurrent requests.
+- [x] Add remediation regression coverage and publish the v1.0.1 package after
+  local and remote release gates pass.
 
 ## Documentation maintenance
 

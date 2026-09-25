@@ -27,5 +27,5 @@ Validate a release before applying it:
 
 ```bash
 helm lint deploy/helm/shorts-studio
-helm template shorts-studio deploy/helm/shorts-studio --set image.tag=0.11.3
+helm template shorts-studio deploy/helm/shorts-studio --set image.tag=1.0.1 --set-string secretEnv.SHORTS_API_TOKEN=ci-placeholder-token
 ```

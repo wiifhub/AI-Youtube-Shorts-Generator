@@ -7,7 +7,7 @@
 <p align="center"><strong>A local-first workspace for turning long videos into polished short-form clips.</strong></p>
 
 <p align="center">
-  <a href="https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/tag/v1.0.0">Latest release: v1.0.0</a>
+  <a href="https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/tag/v1.0.1">Latest release: v1.0.1</a>
   &nbsp; | &nbsp;
   <a href="CHANGELOG.md">Changelog</a>
   &nbsp; | &nbsp;
@@ -22,7 +22,24 @@
 
 Shorts Studio is an independent desktop and web workspace maintained by **wiifhub**. It takes a YouTube URL or a local video, finds strong moments, gives you control over the framing and captions, and renders ready-to-publish clips. Local mode keeps source media and rendered files on your computer; API mode is available when you prefer hosted processing.
 
-## v1.0.0 production release
+## v1.0.1 security hardening release
+
+The v1.0.1 patch release hardens credential redaction, authenticated
+loopback handling, update provenance, concurrent uploads/renders, cancellation
+generations, FFmpeg path handling, and media ownership boundaries. It includes
+the verified Windows installer/portable package and the matching multi-arch
+Docker image.
+
+### Windows downloads
+
+1. Download [ShortsStudio-Setup-v1.0.1.exe](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v1.0.1/ShortsStudio-Setup-v1.0.1.exe).
+2. Or download [ShortsStudio-v1.0.1-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v1.0.1/ShortsStudio-v1.0.1-windows.zip).
+3. Verify either file against `SHA256SUMS-v1.0.1.txt` attached to the release.
+
+The public Windows artifacts remain intentionally unsigned until the owner
+certificate is configured; the release includes an explicit signing report.
+
+## v1.0.0 production release (historical context)
 
 The production-readiness work was developed on [`beta/v1.0.0`](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/tree/beta/v1.0.0) and is now merged into `main`.
 Read the [beta user guide](docs/USER_GUIDE.md) for the versioned API,
@@ -34,17 +51,19 @@ running; new integrations should use `/api/v1/`. The older `/api/` routes
 remain available during the deprecation window and advertise their v1
 successor in response headers. Beta artifact and release-gate evidence is
 tracked in [docs/release-gates-v1.0.0-beta.md](docs/release-gates-v1.0.0-beta.md).
-The separate beta prerelease remains available at the [`beta` release channel](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/tag/beta),
-and the production `v1.0.0` release contains the same gated runtime with the
-versioned package metadata below.
+The separate beta prerelease remains available at the [`beta` release channel](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/tag/beta).
+The current package metadata and downloads are listed in the v1.0.1 section
+above.
 
 ## Windows installation
 
-The latest packaged Windows desktop binaries are v1.0.0, released alongside the Docker distribution below.
+The v1.0.0 packaged Windows desktop binaries were released alongside that
+version's Docker distribution; use the v1.0.1 links above for the current
+release.
 
 ### Recommended: installer
 
-1. Download [ShortsStudio-Setup-v1.0.0.exe](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v1.0.0/ShortsStudio-Setup-v1.0.0.exe).
+1. Download [ShortsStudio-Setup-v1.0.1.exe](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v1.0.1/ShortsStudio-Setup-v1.0.1.exe).
 2. Run the installer and choose whether to create a desktop shortcut.
 3. Start **Shorts Studio** from the Start menu or desktop.
 
@@ -54,7 +73,7 @@ Windows may show SmartScreen for an unsigned build. Select **More info -> Run an
 
 ### Portable ZIP
 
-1. Download [ShortsStudio-v1.0.0-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v1.0.0/ShortsStudio-v1.0.0-windows.zip).
+1. Download [ShortsStudio-v1.0.1-windows.zip](https://github.com/wiifhub/AI-Youtube-Shorts-Generator/releases/download/v1.0.1/ShortsStudio-v1.0.1-windows.zip).
 2. Extract the entire ZIP to a folder (do not run the EXE inside the archive).
 3. Run `unblock_and_start.bat`, or double-click `ShortsStudio.exe` after Windows has unblocked the files.
 
@@ -76,7 +95,7 @@ Settings also includes:
 
 ## Docker deployment
 
-Release `v1.0.0` bundles the Windows desktop app and the reproducible Docker server image in one release. Docker supports Linux hosts, Docker Desktop, NAS machines, and home servers; the container serves the same FastAPI workspace over HTTP and does not need the Windows desktop shell or a separate Python installation on the host.
+Release `v1.0.1` bundles the Windows desktop app and the reproducible Docker server image in one release. Docker supports Linux hosts, Docker Desktop, NAS machines, and home servers; the container serves the same FastAPI workspace over HTTP and does not need the Windows desktop shell or a separate Python installation on the host.
 
 ### Quick start (CPU)
 
@@ -90,13 +109,13 @@ docker compose --env-file .env.docker up --build
 
 Then open <http://127.0.0.1:7860>. Projects, uploads, transcripts, Whisper models, and rendered clips live in the named `shorts_studio_data` volume and survive container restarts. `docker compose down` keeps that data; `docker compose down -v` removes it.
 
-The published CPU image is also available at `ghcr.io/wiifhub/shorts-studio:v1.0.0` (the `latest` tag tracks the newest release) and is built for `linux/amd64` and `linux/arm64`:
+The published CPU image is also available at `ghcr.io/wiifhub/shorts-studio:v1.0.1` (the `latest` tag tracks the newest release) and is built for `linux/amd64` and `linux/arm64`:
 
 ```bash
 docker run --rm -p 127.0.0.1:7860:7860 \
   -v shorts_studio_data:/data \
   --env-file .env.docker \
-  ghcr.io/wiifhub/shorts-studio:v1.0.0
+  ghcr.io/wiifhub/shorts-studio:v1.0.1
 ```
 
 ### NVIDIA GPU mode
@@ -442,7 +461,7 @@ To sign release artifacts, configure the owner-controlled certificate/Apple
 credentials in the environment and run:
 
 ```powershell
-.\venv\Scripts\python.exe scripts\sign_artifacts.py release\ShortsStudio-Setup-v1.0.0.exe --report release\signing-report-v1.0.0.json
+.\venv\Scripts\python.exe scripts\sign_artifacts.py release\ShortsStudio-Setup-v1.0.1.exe --report release\signing-report-v1.0.1.json
 ```
 
 Without those credentials the tool records an explicit unsigned report and

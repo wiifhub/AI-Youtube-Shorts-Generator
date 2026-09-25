@@ -1,13 +1,31 @@
 # Shorts Studio Upgrade Roadmap
 
-**Published baseline:** v1.0.0 (local and remote gates passed)
-**Current development branch:** `main` (v1.0.0 production release)
+**Published baseline:** v1.0.1 (local and remote gates passed)
+**Current development branch:** `main` (v1.0.1 production release)
 **Next implementation target:** v2.0.0
-**Last updated:** 2026-09-19
+**Last updated:** 2026-09-25
 
 The actionable implementation list now lives in [TODO.md](TODO.md). This
 roadmap tracks release milestones and verified state; it is not a second
 unordered TODO list.
+
+---
+
+## v1.0.1 — Security and reliability hardening
+
+The v1.0.1 patch release carries the post-v1.0.0 security review and the
+concurrency/path fixes completed on `main`.
+
+- [x] Scrub URL credentials and session secrets from every durable job,
+      backup, factory, and logging representation.
+- [x] Harden loopback host handling, browser-to-loopback access, job IDs,
+      update provenance, and weak-secret state mutation boundaries.
+- [x] Make upload idempotency, render scratch files, clip revisions, retry
+      admission, and cancellation generation-safe under concurrent requests.
+- [x] Keep FFmpeg paths, waveform/preview work, and cleanup/backup media inside
+      their intended ownership boundaries.
+- [x] Run the full local test/lint/type/security/package smoke gates and publish
+      the verified Windows and Docker artifacts from the v1.0.1 tag.
 
 ---
 

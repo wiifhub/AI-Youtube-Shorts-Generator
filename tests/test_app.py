@@ -1033,6 +1033,7 @@ def test_scratch_files_are_cleaned_but_never_archived(
     assert host_tmp.read_bytes() == b"creator kept this"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length paths are only meaningful on Windows")
 def test_extended_length_path_forms_stay_inside_the_job_boundary(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
