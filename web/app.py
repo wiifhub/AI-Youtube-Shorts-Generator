@@ -1032,7 +1032,16 @@ def _job_snapshot(job: Dict[str, Any]) -> Dict[str, Any]:
         "updated_at": job.get("updated_at", job.get("created_at")),
         "name": _redact_log_text(job.get("name") or request.get("url") or job.get("id") or "Untitled project"),
         "archived": bool(job.get("archived", False)),
-        "can_retry": status in {"error", "cancelled", "interrupted", "draft"} and bool(request.get("url")),
+        # A project whose stored source URL lost credentials can never be fetched
+        # again, so offering Retry/Run would produce a guaranteed error: report
+        # the state so the UI can ask for the URL instead of advertising a dead
+        # action.
+        "source_url_redacted": _source_url_was_redacted(job),
+        "can_retry": (
+            status in {"error", "cancelled", "interrupted", "draft"}
+            and bool(request.get("url"))
+            and not _source_url_was_redacted(job)
+        ),
         "request": safe_request,
         "output_dir": job.get("output_dir"),
     }
@@ -1243,6 +1252,23 @@ def _validate_mode_capabilities(req: JobRequest) -> None:
         raise HTTPException(400, f"API mode does not support {names}; switch to Local mode for these controls.")
 
 
+def _looks_like_local_source(value: str) -> bool:
+    """False only for prose typed into the source box.
+
+    A value with a separator, a media extension, or no whitespace at all is
+    left to the containment check; this exists so that typing a sentence gets a
+    hint instead of an error about an internal output-folder setting.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return True
+    if text.startswith("~") or "/" in text or "\\" in text:
+        return True
+    if Path(text).suffix.lower() in _allowed_upload_extensions:
+        return True
+    return not any(character.isspace() for character in text)
+
+
 def _validate_local_paths(req: JobRequest) -> None:
     """Keep a remotely reachable worker from reading arbitrary host paths."""
     if req.mode != "local":
@@ -1278,6 +1304,12 @@ def _validate_local_paths(req: JobRequest) -> None:
             local_source = unquote(parsed.path)
             if os.name == "nt" and re.match(r"^/[A-Za-z]:", local_source):
                 local_source = local_source[1:]
+        if not _looks_like_local_source(local_source):
+            raise HTTPException(
+                400,
+                "That is not a video link or a file path. Paste a YouTube or video URL, "
+                "or use Choose video to pick a local file.",
+            )
         check(local_source, "source path", must_exist=True)
     check(req.save_folder, "save_folder", must_exist=False)
     check(req.background_music, "background_music", must_exist=True)

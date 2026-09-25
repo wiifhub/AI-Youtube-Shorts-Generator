@@ -85,7 +85,10 @@ def validate_remote_source(source: str) -> str:
         raise ValueError("remote source ports must be 80 or 443")
     host = parsed.hostname.rstrip(".").lower()
     if not _host_allowed(host, _remote_host_allowlist()):
-        raise ValueError("remote source host is not on the administrator allowlist")
+        raise ValueError(
+            f"host {host!r} is not on the allowlist; YouTube links work by default and "
+            "SHORTS_ALLOWED_REMOTE_HOSTS adds other hosts"
+        )
     _public_addresses(host, port or (443 if scheme == "https" else 80))
     return parsed.geturl()
 

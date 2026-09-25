@@ -1056,3 +1056,135 @@ def test_redacted_source_url_is_never_reused_for_resume_or_retry(
     retry = client.post(f"/api/jobs/{job_id}/retry")
     assert retry.status_code == 409
     assert "credentials" in json.dumps(retry.json())
+
+
+# ---------------------------------------------------------------------------
+# The retry affordance must agree with the refusal it is paired with
+# ---------------------------------------------------------------------------
+
+# Pinned literally so a wording change has to break a test on purpose.  The
+# project card paraphrases this text, so the two move together.
+_PINNED_SOURCE_URL_REDACTED_MESSAGE = (
+    "This project's source URL carried credentials that are not stored, so it cannot be fetched again. "
+    "Submit the URL to start a new render."
+)
+
+_RETRYABLE_STATUSES = ("error", "cancelled", "interrupted", "draft")
+
+
+def _enqueue_and_park(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, url: str, status: str
+) -> str:
+    """Enqueue through the real endpoint, then park the record in a retryable state.
+
+    The record itself is always built by ``POST /api/jobs`` so the fetch/stored
+    URL split is the real one; only the terminal status is forced, because the
+    suite never runs a render.  The limiters are raised so the shared per-minute
+    job budget other tests spend cannot decide whether these assertions hold.
+    """
+    monkeypatch.setattr(studio, "_rate_limiter", SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "_upload_rate_limiter", SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "_job_rate_limiter", SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "MUAPI_API_KEY", "mu_test_key_1234567890")
+    _capture_started(monkeypatch)
+    response = client.post("/api/jobs", json={"url": url, "mode": "api"})
+    assert response.status_code == 200
+    job_id = response.json()["id"]
+    with studio._lock:
+        job = studio._jobs[job_id]
+        job["status"] = status
+        job["stage"] = status
+        studio._persist_job_locked(job)
+    return job_id
+
+
+def _card_payload(client: TestClient, job_id: str) -> dict:
+    """The project grid renders from the list route, not the single-job route."""
+    listing = client.get("/api/jobs")
+    assert listing.status_code == 200
+    cards = {job["id"]: job for job in listing.json()["jobs"]}
+    assert job_id in cards, "the queued project is missing from the list the grid renders"
+    return cards[job_id]
+
+
+@pytest.mark.parametrize("status", _RETRYABLE_STATUSES)
+def test_stripped_source_is_never_offered_retry_by_any_endpoint(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    """A stripped source URL cannot be fetched, so no snapshot may advertise Retry.
+
+    Regression: ``can_retry`` ignored the flag, so the card offered a Retry/Run
+    button whose only possible outcome was a 409 -- the dead end this gate
+    exists to remove.  Both endpoints are checked because the grid renders from
+    the list route while the workspace renders from the single-job route.
+    """
+    signed = f"https://customer-abc.cloudflarestream.com/{_STREAM_TOKEN}/manifest/video.m3u8"
+    job_id = _enqueue_and_park(client, monkeypatch, signed, status)
+
+    single = client.get(f"/api/jobs/{job_id}")
+    assert single.status_code == 200
+    assert single.json()["source_url_redacted"] is True
+    assert single.json()["can_retry"] is False
+
+    card = _card_payload(client, job_id)
+    assert card["source_url_redacted"] is True
+    assert card["can_retry"] is False
+
+
+@pytest.mark.parametrize("status", ("error", "interrupted"))
+def test_ordinary_failure_with_intact_url_stays_retryable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    """The honesty gate must not turn every failure into an unretryable record."""
+    url = "https://www.youtube.com/watch?v=aBcD1234&si=SHARE&t=60"
+    job_id = _enqueue_and_park(client, monkeypatch, url, status)
+
+    single = client.get(f"/api/jobs/{job_id}")
+    assert single.status_code == 200
+    assert single.json()["source_url_redacted"] is False
+    assert single.json()["can_retry"] is True
+
+    card = _card_payload(client, job_id)
+    assert card["source_url_redacted"] is False
+    assert card["can_retry"] is True
+
+    # And the advertised action really works rather than 409ing.
+    retry = client.post(f"/api/jobs/{job_id}/retry")
+    assert retry.status_code == 200
+
+
+def test_flagged_record_refusal_wording_is_unchanged(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resume and retry refuse a flagged record with the exact published wording."""
+    assert studio._SOURCE_URL_REDACTED_MESSAGE == _PINNED_SOURCE_URL_REDACTED_MESSAGE
+
+    job_id = _enqueue_and_park(
+        client, monkeypatch, "https://cdn.example/video.mp4?access_token=LEAKEDSECRET", "interrupted"
+    )
+
+    # Resume must leave the record alone rather than fetch the stripped address.
+    resumed: dict = {}
+    monkeypatch.setattr(
+        studio,
+        "_start_job_thread",
+        lambda job_id, req, *args, **kwargs: resumed.__setitem__(job_id, req),
+    )
+    studio._resume_interrupted_jobs()
+    assert job_id not in resumed
+    with studio._lock:
+        job = studio._jobs[job_id]
+        assert job["status"] == "error"
+        assert job["message"] == _PINNED_SOURCE_URL_REDACTED_MESSAGE
+        assert job["error"] == _PINNED_SOURCE_URL_REDACTED_MESSAGE
+
+    retry = client.post(f"/api/jobs/{job_id}/retry")
+    assert retry.status_code == 409
+    assert retry.json() == {"error": _PINNED_SOURCE_URL_REDACTED_MESSAGE, "code": "http_409"}
+
+    # The refusal survives the snapshot without leaking the credential either.
+    returned = client.get(f"/api/jobs/{job_id}")
+    assert returned.status_code == 200
+    assert returned.json()["error"] == _PINNED_SOURCE_URL_REDACTED_MESSAGE
+    assert returned.json()["can_retry"] is False
+    assert "LEAKEDSECRET" not in json.dumps(returned.json())
