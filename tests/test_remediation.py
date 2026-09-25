@@ -76,16 +76,25 @@ def test_record_url_scrub_covers_every_field_without_rewriting_prose() -> None:
         "tuple_url": ("https://x.example/o?access_token=TUPLESECRET",),
     }
 
-    assert redact_record_urls(record) is True
+    redact_record_urls(record)
     assert "deadbeefcafe" not in json.dumps(record)
     assert "FRAGSECRET" not in json.dumps(record)
     assert "TUPLESECRET" not in json.dumps(record)
-    # Functional parameters survive, and prose is not treated as a URL.
+    # Functional parameters survive, prose is not treated as a URL, and a tuple
+    # keeps its type.
     assert record["request"]["url"] == "https://cdn.example/video.mp4?key=abc123"
     assert record["result"]["shorts"][0]["note"] == "see https://docs.example/a b for help"
+    assert isinstance(record["tuple_url"], tuple)
 
-    # A record with nothing to strip reports no change, so nothing is flagged.
-    assert redact_record_urls({"request": {"url": "https://cdn.example/v.mp4?key=abc"}}) is False
+    # A record with nothing to strip stays byte-for-byte identical, so nothing
+    # downstream sees a change it must react to.
+    clean = {
+        "request": {"url": "https://cdn.example/v.mp4?key=abc"},
+        "logs": [{"message": "rendered 3 clips at https://docs.example/a b"}],
+    }
+    before = json.dumps(clean)
+    redact_record_urls(clean)
+    assert json.dumps(clean) == before
 
 
 def test_redact_url_query_is_case_insensitive_and_recursive() -> None:
@@ -932,6 +941,85 @@ def test_completed_render_leaves_no_credential_in_any_persisted_field(
         assert "credentials" in str(studio._jobs[job_id]["message"])
     retry = client.post(f"/api/jobs/{job_id}/retry")
     assert retry.status_code == 409
+
+
+def test_signed_hosted_media_url_does_not_make_a_project_unresumable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """API mode stores the hosted media URL, which is not what resume fetches."""
+    monkeypatch.setattr(studio, "MUAPI_API_KEY", "mu_test_key_1234567890")
+    source = "https://www.youtube.com/watch?v=aBcD1234&si=SHARE&t=60"
+    hosted = f"https://customer-abc.cloudflarestream.com/{_STREAM_TOKEN}/manifest/video.m3u8"
+    handed: dict = {}
+    monkeypatch.setattr(
+        studio,
+        "_start_job_thread",
+        lambda job_id, req, *args, **kwargs: handed.__setitem__(job_id, req),
+    )
+    monkeypatch.setattr(
+        studio,
+        "generate_shorts",
+        lambda **kwargs: {
+            "mode": "api",
+            "source_video_url": hosted,
+            "transcript": {},
+            "highlights": [],
+            "shorts": [],
+            "llm": {},
+        },
+    )
+
+    response = client.post("/api/jobs", json={"url": source, "mode": "api"})
+    job_id = response.json()["id"]
+    studio._run_job(job_id, handed[job_id], None)
+
+    with studio._lock:
+        job = studio._jobs[job_id]
+        # The hosted URL is scrubbed for storage, but it is not the fetch URL.
+        assert job["request"]["url"] == source
+        assert job["raw_source_video_url"] == "https://customer-abc.cloudflarestream.com/manifest/video.m3u8"
+        assert job["source_url_redacted"] is False
+        studio._jobs[job_id]["status"] = "interrupted"
+        studio._persist_job_locked(studio._jobs[job_id])
+
+    resumed: dict = {}
+    monkeypatch.setattr(
+        studio,
+        "_start_job_thread",
+        lambda job_id, req, *args, **kwargs: resumed.__setitem__(job_id, req),
+    )
+    studio._resume_interrupted_jobs()
+    assert job_id in resumed
+    with studio._lock:
+        assert studio._jobs[job_id]["status"] != "error"
+
+
+def test_credential_shaped_project_name_does_not_block_retry(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A project name is free text, not the source URL the fetch depends on."""
+    monkeypatch.setattr(studio, "MUAPI_API_KEY", "mu_test_key_1234567890")
+    _capture_started(monkeypatch)
+    response = client.post(
+        "/api/jobs", json={"url": "https://youtu.be/aBcD1234", "mode": "api"}
+    )
+    job_id = response.json()["id"]
+
+    renamed = client.patch(
+        f"/api/jobs/{job_id}", json={"name": "https://cdn.example/v.mp4?token=abc123"}
+    )
+    assert renamed.status_code == 200
+
+    with studio._lock:
+        job = studio._jobs[job_id]
+        assert "abc123" not in json.dumps(job)  # the credential is not stored
+        assert job["source_url_redacted"] is False
+        assert job["request"]["url"] == "https://youtu.be/aBcD1234"
+        job["status"] = "error"
+        studio._persist_job_locked(job)
+
+    retry = client.post(f"/api/jobs/{job_id}/retry")
+    assert retry.status_code == 200
 
 
 @pytest.mark.parametrize(

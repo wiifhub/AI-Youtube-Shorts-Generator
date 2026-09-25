@@ -669,10 +669,14 @@ def _persist_job_locked(job: Dict[str, Any]) -> None:
     job["updated_at"] = time.time()
     # One owner for the durable record: scrub every URL-bearing field here
     # rather than at each call site, so the completion path's own source field
-    # and any field added later are covered by the same policy.  Whatever
-    # stripped a credential, the stored source can no longer be fetched, so the
-    # record is flagged and resume/retry refuse the stripped address.
-    if redact_record_urls(job):
+    # and any field added later are covered by the same policy.
+    request_value = job.get("request") if isinstance(job.get("request"), dict) else {}
+    fetch_url = request_value.get("url")
+    redact_record_urls(job)
+    # Flag only the URL the fetch depends on.  A signed URL the provider hosted,
+    # a caption or a project name keeps its resume and retry: refusing those
+    # would block a project whose source is perfectly fetchable.
+    if isinstance(fetch_url, str) and fetch_url != request_value.get("url"):
         job["source_url_redacted"] = True
     _job_store.save(job)
     path = _job_path(str(job["id"]))

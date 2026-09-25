@@ -129,47 +129,35 @@ def redact_url_query(value: str) -> str:
 _ABSOLUTE_URL_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://\S+\Z")
 
 
-def _redact_record_value(value: Any) -> Tuple[Any, bool]:
-    """Scrub URL credentials in one JSON-shaped node, returning it and a flag."""
+def _redact_record_urls_in(value: Any) -> Any:
+    """Return one node of a record with credential-bearing URLs stripped."""
     if isinstance(value, str):
         if "://" not in value or not _ABSOLUTE_URL_PATTERN.match(value):
-            return value, False
-        safe = redact_url_query(value)
-        return safe, safe != value
+            return value
+        return redact_url_query(value)
     if isinstance(value, dict):
-        changed = False
         for name, item in list(value.items()):
-            safe, item_changed = _redact_record_value(item)
-            if item_changed:
-                value[name] = safe
-                changed = True
-        return value, changed
+            value[name] = _redact_record_urls_in(item)
+        return value
     if isinstance(value, list):
-        changed = False
         for index, item in enumerate(value):
-            safe, item_changed = _redact_record_value(item)
-            if item_changed:
-                value[index] = safe
-                changed = True
-        return value, changed
+            value[index] = _redact_record_urls_in(item)
+        return value
     if isinstance(value, tuple):
-        items = [_redact_record_value(item) for item in value]
-        if any(item_changed for _, item_changed in items):
-            return [item for item, _ in items], True
-        return value, False
-    return value, False
+        return tuple(_redact_record_urls_in(item) for item in value)
+    return value
 
 
-def redact_record_urls(record: Any) -> bool:
+def redact_record_urls(record: Any) -> None:
     """Scrub credential-bearing URLs anywhere inside a record, in place.
 
-    The single durable write path calls this, so a record cannot reach the
-    SQLite store or the JSON mirror with a credential in a field the policy
-    owner was never told about.  Returns True when anything was stripped; a
-    record whose URLs are all functional is left byte-for-byte unchanged.
+    The durable write path calls this, so a record cannot reach the SQLite
+    store, the JSON mirror or a portable manifest with a credential in a field
+    the policy owner was never told about.  Only a value that *is* an absolute
+    URL reaches the URL policy, so prose and functional URLs are left
+    byte-for-byte unchanged.
     """
-    _, changed = _redact_record_value(record)
-    return changed
+    _redact_record_urls_in(record)
 
 
 def _redact_query_parameters(text: str) -> str:
