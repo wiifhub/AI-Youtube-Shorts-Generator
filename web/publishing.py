@@ -16,6 +16,7 @@ import os
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -126,8 +127,11 @@ _oauth_lock = threading.RLock()
 _oauth_states: Dict[str, Dict[str, Any]] = {}
 _youtube_tokens: Dict[str, Any] = {}
 _upload_results: Dict[str, Dict[str, Any]] = {}
-_upload_key_locks: Dict[str, threading.Lock] = {}
+_upload_key_locks: Dict[str, threading.Lock] = OrderedDict()
 _upload_key_locks_guard = threading.Lock()
+# A key's lock is only useful while a duplicate upload is in flight, so the map
+# keeps the most recent keys instead of retaining one lock per key forever.
+_MAX_UPLOAD_KEY_LOCKS = 64
 _OAUTH_STATE_TTL = 600.0
 _TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 _AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -486,6 +490,28 @@ def _upload_youtube_captions(
     return {"caption_id": caption_id, "language": language, "name": name, "draft": bool(draft), "status": "uploaded"}
 
 
+def _upload_key_lock(key: str) -> threading.Lock:
+    """Return the serialization lock for one publish idempotency key.
+
+    The map is bounded by reusing the oldest *idle* lock, which is safe because
+    a lock is only ever evicted while no caller holds it: two duplicates always
+    still meet on the same object.
+    """
+    with _upload_key_locks_guard:
+        existing = _upload_key_locks.get(key)
+        if existing is not None:
+            _upload_key_locks.move_to_end(key)
+            return existing
+        lock = threading.Lock()
+        _upload_key_locks[key] = lock
+        while len(_upload_key_locks) > _MAX_UPLOAD_KEY_LOCKS:
+            idle = next((name for name, held in _upload_key_locks.items() if not held.locked()), None)
+            if idle is None:
+                break
+            del _upload_key_locks[idle]
+    return lock
+
+
 def _serialize_duplicate_upload(prefix: str):
     """Run a direct upload under a per-idempotency-key lock.
 
@@ -502,9 +528,7 @@ def _serialize_duplicate_upload(prefix: str):
             request_key = str(kwargs.get("idempotency_key") or "").strip()[:160]
             if not request_key:
                 return func(media, *args, **kwargs)
-            with _upload_key_locks_guard:
-                key_lock = _upload_key_locks.setdefault(f"{prefix}:{request_key}", threading.Lock())
-            with key_lock:
+            with _upload_key_lock(f"{prefix}:{request_key}"):
                 return func(media, *args, **kwargs)
 
         return wrapper

@@ -601,6 +601,25 @@ def _dict_value(value: Any) -> Dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
+_EXTENDED_PATH_PREFIX = "\\\\?\\"
+
+
+def _resolved_path(path: Path) -> Path:
+    r"""Return a resolved path in one canonical form.
+
+    ``Path.resolve`` intermittently returns the Windows extended-length form
+    (``\\?\C:\...``) for a directory another thread has just created, and a
+    prefixed path is never *inside* its own unprefixed parent.  Containment
+    checks therefore rejected paths that were genuinely within the trust
+    boundary, and the prefixed form could then be written into a job record.
+    """
+    text = str(path)
+    if text.startswith(_EXTENDED_PATH_PREFIX):
+        remainder = text[len(_EXTENDED_PATH_PREFIX) :]
+        text = "\\\\" + remainder[4:] if remainder.startswith("UNC\\") else remainder
+    return Path(text)
+
+
 def _job_media_path(job: Dict[str, Any], value: Any) -> Optional[Path]:
     """Resolve a generated media path without allowing persisted path escapes.
 
@@ -612,7 +631,7 @@ def _job_media_path(job: Dict[str, Any], value: Any) -> Optional[Path]:
     if not value or str(value).startswith("http"):
         return None
     try:
-        candidate = Path(str(value)).expanduser().resolve()
+        candidate = _resolved_path(Path(str(value)).expanduser().resolve())
         output_dir = _job_output_dir(job)
         candidate.relative_to(output_dir)
     except (OSError, RuntimeError, ValueError, TypeError):
@@ -627,15 +646,15 @@ def _job_output_dir(job: Dict[str, Any]) -> Path:
     # fallback itself inside ``jobs`` even if a malformed record somehow
     # reaches this helper before normal ID validation runs.
     safe_job_id = job_id if _job_id_pattern.fullmatch(job_id) else "invalid-job"
-    fallback = (_jobs_dir / safe_job_id).expanduser().resolve()
+    fallback = _resolved_path((_jobs_dir / safe_job_id).expanduser().resolve())
     raw = job.get("output_dir")
     if not raw:
         return fallback
     try:
-        candidate = Path(str(raw)).expanduser().resolve()
+        candidate = _resolved_path(Path(str(raw)).expanduser().resolve())
         if _allow_external_paths:
             return candidate
-        candidate.relative_to(_output_root.resolve())
+        candidate.relative_to(_resolved_path(_output_root.resolve()))
         return candidate
     except (OSError, RuntimeError, ValueError, TypeError):
         return fallback
@@ -646,9 +665,9 @@ def _job_source_path(job: Dict[str, Any], value: Any) -> Optional[Path]:
     if not value or str(value).startswith(("http://", "https://")):
         return None
     try:
-        candidate = Path(str(value)).expanduser().resolve()
+        candidate = _resolved_path(Path(str(value)).expanduser().resolve())
         if not _allow_external_paths:
-            candidate.relative_to(_output_root.resolve())
+            candidate.relative_to(_resolved_path(_output_root.resolve()))
         return candidate if candidate.is_file() else None
     except (OSError, RuntimeError, ValueError, TypeError):
         return None
@@ -727,6 +746,36 @@ def _media_operation(job_id: str):
         _media_slots.release()
 
 
+_artifact_locks: Dict[str, threading.Lock] = {}
+_artifact_locks_guard = threading.Lock()
+_MAX_ARTIFACT_LOCKS = 64
+
+
+@contextmanager
+def _artifact_lock(target: str):
+    """Serialize the writers of one media artifact.
+
+    Two concurrent edits of one clip publish onto the same path, and a replace
+    that collides with another writer's replace, or with a reader of the
+    published file, fails with a sharing violation on Windows.  The lock is held
+    only for the publish step, never across a render, and a held lock is never
+    evicted, so concurrent writers always meet on the same object.
+    """
+    key = os.path.normcase(str(target))
+    with _artifact_locks_guard:
+        lock = _artifact_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _artifact_locks[key] = lock
+            while len(_artifact_locks) > _MAX_ARTIFACT_LOCKS:
+                idle = next((name for name, held in _artifact_locks.items() if not held.locked()), None)
+                if idle is None:
+                    break
+                del _artifact_locks[idle]
+    with lock:
+        yield
+
+
 def _media_scratch_path(target: str, suffix: str) -> str:
     """Return a request-unique scratch path beside a render target.
 
@@ -736,6 +785,30 @@ def _media_scratch_path(target: str, suffix: str) -> str:
     cleanup still recognises and removes the file.
     """
     return f"{target}.{uuid.uuid4().hex[:8]}{suffix}"
+
+
+# One owner for the renderer scratch suffixes.  The media cleanup deletes them, the
+# backup never archives them, and the two copies of this list had already drifted
+# apart, which would have left the naming and its consumers silently out of sync.
+SCRATCH_FILE_SUFFIXES = (
+    ".part",
+    ".cut.mp4",
+    ".base.mp4",
+    ".render.mp4",
+    ".audio.mp4",
+    ".jump.mp4",
+    ".extras.mp4",
+    ".branded.mp4",
+    ".silent.mp4",
+    ".regenerate.mp4",
+)
+# A host temporary file is never archived either, but it is not ours to delete.
+BACKUP_SKIP_SUFFIXES = SCRATCH_FILE_SUFFIXES + (".tmp",)
+
+
+def _is_scratch_path(path: Path) -> bool:
+    """Return true when a path is renderer scratch rather than finished media."""
+    return path.name.endswith(SCRATCH_FILE_SUFFIXES)
 
 
 def _run_media_command(job_id: str, args: List[str], timeout: float = 90.0) -> subprocess.CompletedProcess[Any]:
@@ -1132,20 +1205,8 @@ def _cleanup_job_temporary_files(job: Dict[str, Any]) -> None:
         root = _job_output_dir(job)
         if not root.is_dir():
             return
-        scratch_suffixes = (
-            ".part",
-            ".cut.mp4",
-            ".base.mp4",
-            ".render.mp4",
-            ".audio.mp4",
-            ".jump.mp4",
-            ".extras.mp4",
-            ".branded.mp4",
-            ".silent.mp4",
-            ".regenerate.mp4",
-        )
         for item in root.rglob("*"):
-            if not item.is_file() or not item.name.endswith(scratch_suffixes):
+            if not item.is_file() or not _is_scratch_path(item):
                 continue
             try:
                 item.unlink()

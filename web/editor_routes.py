@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -74,8 +75,11 @@ def _clip_metadata(item: Dict[str, Any]) -> Dict[str, Any]:
 
 def _history_dir(studio: Any, job: Dict[str, Any], index: int) -> Path:
     """Return the private, job-scoped media history directory for one clip."""
-    output_dir = studio._job_output_dir(job).resolve()
-    history_dir = (output_dir / ".history" / str(index)).resolve()
+    # Both sides go through the canonical form: a concurrently created history
+    # directory resolves to the Windows extended-length form, which is never
+    # "inside" its own unprefixed parent.
+    output_dir = studio._resolved_path(studio._job_output_dir(job).resolve())
+    history_dir = studio._resolved_path((output_dir / ".history" / str(index)).resolve())
     history_dir.relative_to(output_dir)
     history_dir.mkdir(parents=True, exist_ok=True)
     return history_dir
@@ -157,6 +161,23 @@ def _set_history_state(
     return item
 
 
+def _publish_clip_thumbnail(clip_path: str, replacement: Dict[str, Any]) -> None:
+    """Refresh the thumbnail beside a freshly published clip.
+
+    Callers hold the artifact lock for ``clip_path`` so the clip and its
+    thumbnail are never read while another edit replaces either one.
+    """
+    try:
+        from shorts_generator.local.visual import extract_thumbnail
+
+        thumb = str(Path(clip_path).with_suffix(".jpg"))
+        extract_thumbnail(clip_path, LOCAL_THUMBNAIL_POSITION, thumb)
+        replacement["thumbnail_path"] = thumb
+    except Exception:
+        # Optional OpenCV thumbnail work must not make an edit fail.
+        return
+
+
 def _refresh_clip_thumbnail(studio: Any, job: Dict[str, Any], clip_path: Optional[Path], item: Dict[str, Any]) -> None:
     """Refresh a local thumbnail after restoring a clip version when possible."""
     if not clip_path or not clip_path.is_file():
@@ -219,7 +240,6 @@ def _commit_edit_history(
     index: int,
     old: Dict[str, Any],
     replacement: Dict[str, Any],
-    old_media_path: Optional[Path] = None,
     history_media_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Push an edit onto the durable undo stack and clear redo versions."""
@@ -228,7 +248,7 @@ def _commit_edit_history(
         _discard_history_entry(entry, studio, job)
     history.append(
         {
-            "media_path": history_media_path or _copy_history_media(studio, job, index, old_media_path, "undo"),
+            "media_path": history_media_path,
             "metadata": _clip_metadata(old),
         }
     )
@@ -292,7 +312,12 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
             else:
                 job_output_dir = str(studio._job_output_dir(job))
                 out_path = str(Path(job_output_dir).expanduser().resolve() / _output_filename(index + 1))
-            undo_path = out_path + ".undo.mp4"
+            # Snapshot the exact version this edit read, before the render starts.
+            # Copying it afterwards pairs this edit's metadata with whatever media
+            # a concurrent edit of the same clip has already moved into place.
+            if old_media_path and old_media_path.is_file():
+                with studio._artifact_lock(out_path):
+                    history_media_path = _copy_history_media(studio, job, index, old_media_path, "undo")
             render_path = studio._media_scratch_path(out_path, ".regenerate.mp4")
             timeline_map = []
             background_music = _local_asset(studio, job, request.get("background_music"), "background music")
@@ -345,12 +370,6 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
                 )
             if not os.path.isfile(render_path):
                 raise RuntimeError("clip renderer did not produce an output file")
-            # Keep the current clip and its previous undo snapshot untouched
-            # until the replacement render has completed successfully.
-            if os.path.isfile(out_path):
-                shutil.copyfile(out_path, undo_path)
-                history_media_path = _copy_history_media(studio, job, index, Path(out_path), "undo")
-            os.replace(render_path, out_path)
             replacement = {
                 **old,
                 "start_time": update.start_time,
@@ -381,18 +400,12 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
                     for left, right in timeline_map
                 ],
             }
-            replacement["undo_path"] = undo_path if os.path.isfile(undo_path) else None
-            replacement["undo_metadata"] = {
-                key: value for key, value in old.items() if key not in {"undo_path", "undo_metadata"}
-            }
-            try:
-                from shorts_generator.local.visual import extract_thumbnail
-
-                thumb = str(Path(out_path).with_suffix(".jpg"))
-                extract_thumbnail(out_path, LOCAL_THUMBNAIL_POSITION, thumb)
-                replacement["thumbnail_path"] = thumb
-            except Exception:
-                pass
+            # Keep the current clip untouched until the replacement render has
+            # completed successfully, and publish the clip and its thumbnail in
+            # one step so a concurrent edit cannot interleave with either.
+            with studio._artifact_lock(out_path):
+                os.replace(render_path, out_path)
+                _publish_clip_thumbnail(out_path, replacement)
         elif mode == "api":
             unsupported_api_edit = (
                 update.cuts
@@ -451,6 +464,10 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
                     os.remove(render_path)
                 except OSError:
                     pass
+            # The edit never landed, so its pre-image snapshot is unreferenced.
+            snapshot = locals().get("history_media_path")
+            if snapshot:
+                _discard_history_entry({"media_path": snapshot}, studio, job)
         raise HTTPException(500, f"could not regenerate clip: {exc}") from exc
 
     with studio._lock:
@@ -464,7 +481,6 @@ def update_clip(job_id: str, index: int, update: ClipUpdate) -> Dict[str, Any]:
             index,
             old,
             replacement,
-            old_media_path=old_media_path,
             history_media_path=history_media_path,
         )
         current[index] = replacement
@@ -1083,14 +1099,13 @@ def preview_clip(job_id: str, update: ClipUpdate) -> Dict[str, Any]:
         :20
     ]
     cached = preview_dir / f"preview_{preview_key}.mp4"
-    preview = Path(output_dir) / "preview.mp4"
+    # The artifact is named for the settings it was rendered from, and the URL
+    # carries that name: promoting the render to one fixed ``preview.mp4`` made
+    # two concurrent previews hand every requester whichever render finished
+    # last, so a caller played back another caller's draft.
+    preview_url = f"/api/jobs/{job_id}/preview/{cached.name}"
     if cached.is_file():
-        shutil.copyfile(cached, preview)
-        return {
-            "preview_url": f"/api/jobs/{job_id}/preview.mp4",
-            "path": str(preview),
-            "cached": True,
-        }
+        return {"preview_url": preview_url, "path": str(cached), "cached": True}
     render_path = Path(studio._media_scratch_path(str(preview_dir / f"preview_{preview_key}.mp4"), ".render.mp4"))
     try:
         with studio._media_operation(job_id), runtime_job_control(
@@ -1138,25 +1153,60 @@ def preview_clip(job_id: str, update: ClipUpdate) -> Dict[str, Any]:
         if not render_path.is_file():
             raise RuntimeError("preview renderer did not produce an output file")
         os.replace(render_path, cached)
-        shutil.copyfile(cached, preview)
     finally:
         if render_path.is_file():
             try:
                 render_path.unlink()
             except OSError:
                 pass
-    return {"preview_url": f"/api/jobs/{job_id}/preview.mp4", "path": str(preview), "cached": False}
+    return {"preview_url": preview_url, "path": str(cached), "cached": False}
+
+
+# Draft previews are content-addressed by a 20-hex-character settings digest.
+_PREVIEW_ARTIFACT_PATTERN = re.compile(r"preview_[0-9a-f]{20}\.mp4")
+
+
+def _preview_artifact(studio: Any, job: Dict[str, Any], name: str) -> Optional[Path]:
+    """Resolve one named draft preview inside the job's own output directory."""
+    if not _PREVIEW_ARTIFACT_PATTERN.fullmatch(name):
+        return None
+    return studio._job_media_path(job, Path(str(studio._job_output_dir(job))) / "previews" / name)
+
+
+def _latest_preview_artifact(studio: Any, job: Dict[str, Any]) -> Optional[Path]:
+    """Return the newest finished draft preview, or ``None`` when there is none."""
+    directory = Path(str(studio._job_output_dir(job))) / "previews"
+    try:
+        candidates = [item for item in directory.iterdir() if _PREVIEW_ARTIFACT_PATTERN.fullmatch(item.name)]
+        return max(candidates, key=lambda item: item.stat().st_mtime_ns)
+    except (OSError, ValueError):
+        return None
 
 
 @router.get("/api/jobs/{job_id}/preview.mp4")
 def get_preview(job_id: str):
+    """Serve the newest draft preview through the legacy fixed URL."""
     studio = _studio()
     with studio._lock:
         job = studio._jobs.get(job_id)
         if not job:
             raise HTTPException(404, "job not found")
         output_dir = Path(str(job.get("output_dir") or (studio._jobs_dir / job_id)))
-        path = studio._job_media_path(job, output_dir / "preview.mp4")
+        path = _latest_preview_artifact(studio, job) or studio._job_media_path(job, output_dir / "preview.mp4")
+    if not path or not path.is_file():
+        raise HTTPException(404, "preview not found")
+    return FileResponse(path, media_type="video/mp4", filename=path.name)
+
+
+@router.get("/api/jobs/{job_id}/preview/{name}")
+def get_preview_artifact(job_id: str, name: str):
+    """Serve one requester's own draft preview by the key it was rendered for."""
+    studio = _studio()
+    with studio._lock:
+        job = studio._jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "job not found")
+        path = _preview_artifact(studio, job, name)
     if not path or not path.is_file():
         raise HTTPException(404, "preview not found")
     return FileResponse(path, media_type="video/mp4", filename=path.name)

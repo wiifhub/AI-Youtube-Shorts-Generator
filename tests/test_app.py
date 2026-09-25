@@ -11,6 +11,7 @@ import threading
 import time
 import tracemalloc
 import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -863,23 +864,28 @@ def test_concurrent_clip_regenerations_do_not_share_one_scratch_file(
     """Two regenerations of one clip must render to their own scratch files.
 
     FFmpeg truncates its output, so a shared scratch path leaves a partial
-    render that is then moved over the previous good clip.
+    render that is then moved over the previous good clip.  Each edit must also
+    own the undo snapshot it stores: one fixed ``<clip>.undo.mp4`` meant two
+    edits overwrote each other's revision, and the edit that copied the file
+    last recorded the *other* edit's render next to its own metadata.
     """
     from web import editor_routes
     from web.models import ClipUpdate
 
     clip_path = _local_render_job(monkeypatch, tmp_path, "scratch-clip-job")
+    original = clip_path.read_bytes()
+    payloads = {1.0: b"render-1.0-" + b"P" * 4096, 20.0: b"render-20.0-" + b"P" * 4096}
     gate = threading.Barrier(2)
     render_paths: list[str] = []
+    outcomes: list[str] = []
     render_lock = threading.Lock()
 
-    def fake_render(_source, _start, _end, _aspect, out_path, **_kwargs):
-        thread = threading.get_ident()
+    def fake_render(_source, start, _end, _aspect, out_path, **_kwargs):
         with render_lock:
             render_paths.append(str(out_path))
         gate.wait(timeout=15)
         with open(out_path, "wb") as stream:
-            stream.write(f"render-{thread}".encode())
+            stream.write(payloads[start])
         return str(out_path)
 
     monkeypatch.setattr("shorts_generator.local.clipper.crop_clip_local", fake_render)
@@ -889,56 +895,158 @@ def test_concurrent_clip_regenerations_do_not_share_one_scratch_file(
             editor_routes.update_clip(
                 "scratch-clip-job", 0, ClipUpdate(start_time=start, end_time=start + 2.0)
             )
-        except Exception:  # noqa: BLE001 - the racing loser may fail its commit
-            pass
+            outcome = "ok"
+        except Exception as exc:  # noqa: BLE001 - record rather than hide a failure
+            outcome = f"failed: {exc}"
+        with render_lock:
+            outcomes.append(outcome)
 
-    threads = [threading.Thread(target=regenerate, args=(1.0,)), threading.Thread(target=regenerate, args=(20.0,))]
+    threads = [threading.Thread(target=regenerate, args=(start,)) for start in payloads]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=20)
+        thread.join(timeout=30)
 
     assert len(render_paths) == 2
     assert render_paths[0] != render_paths[1]
-    assert clip_path.read_bytes().startswith(b"render-")
+    assert outcomes == ["ok", "ok"]
+    # The clip is one whole render, never a torn fragment of two writers.
+    assert clip_path.read_bytes() in payloads.values()
+    # No shared snapshot path survives for two edits to overwrite.
+    assert not (clip_path.parent / (clip_path.name + ".undo.mp4")).exists()
+    with studio._lock:
+        job = studio._jobs["scratch-clip-job"]
+        history = (job.get("clip_history") or {}).get("0") or []
+        clip = (job.get("raw_shorts") or [])[0]
+    assert len(history) == 2
+    # Both edits reached the barrier before either replaced the clip, so each
+    # snapshot must hold the whole pre-image that edit started from.
+    for entry in history:
+        snapshot = Path(str(entry["media_path"]))
+        assert snapshot.is_file()
+        assert snapshot.read_bytes() == original
+    assert clip["undo_path"] == history[-1]["media_path"]
 
 
 def test_concurrent_previews_do_not_share_one_scratch_file(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """Two identical preview requests must render to their own scratch files."""
+    """Two concurrent previews must each play back their own draft.
+
+    Promoting a finished draft to one fixed ``preview.mp4`` made both requests
+    answer with the same URL, so whichever render finished last decided what
+    the other caller was told to play: a requester silently received another
+    requester's preview.
+    """
     from web import editor_routes
     from web.models import ClipUpdate
 
     _local_render_job(monkeypatch, tmp_path, "scratch-preview-job")
+    payloads = {2.0: b"render-2.0-" + b"P" * 4096, 20.0: b"render-20.0-" + b"P" * 4096}
     gate = threading.Barrier(2)
     render_paths: list[str] = []
+    answers: dict[float, dict] = {}
     render_lock = threading.Lock()
 
-    def fake_render(_source, _start, _end, _aspect, out_path, **_kwargs):
-        thread = threading.get_ident()
+    def fake_render(_source, start, _end, _aspect, out_path, **_kwargs):
         with render_lock:
             render_paths.append(str(out_path))
         gate.wait(timeout=15)
         with open(out_path, "wb") as stream:
-            stream.write(f"render-{thread}".encode())
+            stream.write(payloads[start])
         return str(out_path)
 
     monkeypatch.setattr("shorts_generator.local.clipper.crop_clip_local", fake_render)
 
-    def preview() -> None:
-        try:
-            editor_routes.preview_clip(
-                "scratch-preview-job", ClipUpdate(start_time=2.0, end_time=6.0)
-            )
-        except Exception:  # noqa: BLE001 - the racing loser may fail its replace
-            pass
+    def preview(start: float) -> None:
+        response = editor_routes.preview_clip(
+            "scratch-preview-job", ClipUpdate(start_time=start, end_time=start + 2.0)
+        )
+        with render_lock:
+            answers[start] = response
 
-    threads = [threading.Thread(target=preview), threading.Thread(target=preview)]
+    threads = [threading.Thread(target=preview, args=(start,)) for start in payloads]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=20)
+        thread.join(timeout=30)
 
     assert len(render_paths) == 2
     assert render_paths[0] != render_paths[1]
+    assert set(answers) == set(payloads)
+    assert answers[2.0]["preview_url"] != answers[20.0]["preview_url"]
+    # Each requester's own URL serves their own render, whole and unreplaced,
+    # with the cache-busting query the editor appends to preview_url.
+    for start, answer in answers.items():
+        served = client.get(f"{answer['preview_url']}?t=1700000000000")
+        assert served.status_code == 200
+        assert served.content == payloads[start]
+    # Nothing is promoted onto a shared path for the two renders to fight over.
+    assert not (tmp_path / "jobs" / "scratch-preview-job" / "preview.mp4").exists()
+    # The legacy fixed URL still serves the newest draft.
+    legacy = client.get("/api/jobs/scratch-preview-job/preview.mp4")
+    assert legacy.status_code == 200
+    assert legacy.content in payloads.values()
+    # An unknown or path-shaped artifact name is never served.
+    assert client.get("/api/jobs/scratch-preview-job/preview/preview_00000000000000000000.mp4").status_code == 404
+    assert client.get("/api/jobs/scratch-preview-job/preview/..%2Fpreview.mp4").status_code == 404
+
+
+def test_scratch_files_are_cleaned_but_never_archived(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """One suffix policy, asserted through both of its consumers.
+
+    The media cleanup and the media backup each carried their own copy of the
+    renderer scratch suffixes, and the copies had already drifted apart, so a
+    file could be archived by one and deleted by the other.  Renderer scratch
+    is skipped by a backup and removed by cleanup; a host temporary file is
+    skipped by a backup but is not ours to delete.
+    """
+    monkeypatch.setattr(studio, "_min_free_gb", 0)
+    _local_render_job(monkeypatch, tmp_path, "scratch-policy-job")
+    output_dir = tmp_path / "jobs" / "scratch-policy-job"
+    scratch = output_dir / "short_09.mp4.render.mp4"
+    scratch.write_bytes(b"scratch")
+    host_tmp = output_dir / "creator-notes.tmp"
+    host_tmp.write_bytes(b"creator kept this")
+
+    response = backup_projects(include_media=True)
+
+    async def drain() -> list[bytes]:
+        return [chunk async for chunk in response.body_iterator]
+
+    with zipfile.ZipFile(io.BytesIO(b"".join(asyncio.run(drain())))) as archive:
+        names = archive.namelist()
+    assert "media/scratch-policy-job/short_01.mp4" in names
+    assert not any(name.endswith(".render.mp4") for name in names)
+    assert "media/scratch-policy-job/creator-notes.tmp" not in names
+
+    with studio._lock:
+        studio._cleanup_job_temporary_files(studio._jobs["scratch-policy-job"])
+
+    assert not scratch.exists()
+    assert host_tmp.read_bytes() == b"creator kept this"
+
+
+def test_extended_length_path_forms_stay_inside_the_job_boundary(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A Windows extended-length path is the same file, so it resolves inside.
+
+    ``Path.resolve`` returns the extended form (``\\\\?\\C:\\...``) intermittently
+    for a directory another thread has just created, and a prefixed path is
+    never inside its own unprefixed parent.  The trust boundary therefore
+    rejected real job media, and the prefixed form could be persisted into a
+    job record where every later read would fail the same comparison.
+    """
+    clip_path = _local_render_job(monkeypatch, tmp_path, "extended-path-job")
+    output_dir = tmp_path / "jobs" / "extended-path-job"
+    prefix = "\\" * 2 + "?" + "\\"
+    with studio._lock:
+        job = studio._jobs["extended-path-job"]
+        assert studio._job_media_path(job, prefix + str(clip_path.resolve())) == clip_path.resolve()
+        job["output_dir"] = prefix + str(output_dir.resolve())
+        assert studio._job_output_dir(job) == output_dir.resolve()
+        # Outside the boundary is still refused in either spelling.
+        assert studio._job_media_path(job, prefix + str((tmp_path / "outside.mp4").resolve())) is None

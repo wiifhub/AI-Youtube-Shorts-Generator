@@ -297,19 +297,6 @@ def backup_projects(include_media: bool = Query(default=False)) -> StreamingResp
     media_files: List[tuple[str, Path, int]] = []
     media_bytes = 0
     max_media_bytes = 512 * 1024 * 1024
-    scratch_suffixes = (
-        ".part",
-        ".cut.mp4",
-        ".base.mp4",
-        ".render.mp4",
-        ".audio.mp4",
-        ".jump.mp4",
-        ".extras.mp4",
-        ".branded.mp4",
-        ".silent.mp4",
-        ".regenerate.mp4",
-        ".tmp",
-    )
     with studio._lock:
         records = []
         for job in studio._jobs.values():
@@ -360,7 +347,7 @@ def backup_projects(include_media: bool = Query(default=False)) -> StreamingResp
                 output_dir = studio._job_output_dir(job)
                 if output_dir.is_dir():
                     for media_path in output_dir.rglob("*"):
-                        if not media_path.is_file() or media_path.name.endswith(scratch_suffixes):
+                        if not media_path.is_file() or media_path.name.endswith(studio.BACKUP_SKIP_SUFFIXES):
                             continue
                         try:
                             relative = media_path.relative_to(output_dir)

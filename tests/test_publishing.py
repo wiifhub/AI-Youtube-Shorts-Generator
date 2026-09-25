@@ -244,3 +244,20 @@ def test_two_approvals_with_one_idempotency_key_upload_once(monkeypatch, tmp_pat
     assert calls.count("POST") == 1
     assert calls.count("PUT") == 1
     assert [result["video_id"] for result in results] == ["video-1", "video-1"]
+
+
+def test_publish_idempotency_locks_stay_bounded() -> None:
+    """One retained lock per publish key would grow with every upload ever made.
+
+    Trimming the map is only safe while a held lock is never evicted, because
+    two duplicates of one key have to meet on the same object.
+    """
+    held = publishing._upload_key_lock("held-key")
+    try:
+        with held:
+            for index in range(publishing._MAX_UPLOAD_KEY_LOCKS * 3):
+                publishing._upload_key_lock(f"key-{index}")
+            assert len(publishing._upload_key_locks) <= publishing._MAX_UPLOAD_KEY_LOCKS
+            assert publishing._upload_key_lock("held-key") is held
+    finally:
+        publishing._upload_key_locks.clear()
