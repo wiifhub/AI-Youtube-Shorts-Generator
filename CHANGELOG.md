@@ -34,8 +34,22 @@ All notable Shorts Studio changes are recorded here. Dates use ISO 8601.
 - Added focused remediation coverage for credential redaction, route-shaped
   render budgets, path boundaries, update provenance, concurrent writes, and
   cancellation semantics.
-- Release artifacts and the final remote CI/Docker checks are recorded after
-  the v1.0.1 tag is published.
+- Local release gates passed: 202 tests passed, 4 were skipped, coverage was
+  68.46%, and Ruff, strict mypy, Bandit, Node syntax, six-manifest
+  `pip-audit`, and `git diff --check` were clean.
+- The v1.0.1 portable payload smoke passed health, anonymous rejection,
+  authenticated system access, UI version `1.0.1`, authenticated shutdown,
+  clean process exit, and bundled FFmpeg/FFprobe checks. The installer was
+  compiled successfully; a fresh installer launch requires an elevated UAC
+  session and could not be repeated from this non-elevated release shell.
+- Main Quality Checks run `36195605900`, main Docker publish run
+  `36195605940`, tag Docker publish run `36196233494`, nightly/beta run
+  `36195605903`, and draft-release run `36195605951` passed.
+- Windows artifact hashes match the attached manifest: installer
+  `69D884AC6414E255ABC467A236D13F7B41EEC686137A6949F28E0753112D08BF` and
+  portable ZIP `2C21DDE0037339F46B4930B05A536175D7228762A6F53D5A32E7AA1D01F1D259`.
+- Authenticode remains intentionally unsigned because the owner certificate is
+  not configured; the SHA-256 manifest is included with the release.
 
 ## [1.0.0] - 2026-09-15
 

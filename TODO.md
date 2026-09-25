@@ -20,6 +20,14 @@ than remaining as open TODOs.
   cancellation generation-safe under concurrent requests.
 - [x] Add remediation regression coverage and publish the v1.0.1 package after
   local and remote release gates pass.
+- [x] Record final v1.0.1 evidence: 202 tests passed, 4 skipped, 68.46%
+  coverage; Quality Checks `36195605900`; Docker publish runs `36195605940`
+  and `36196233494`; and the portable payload passed authenticated shutdown
+  and clean-exit smoke. The installer compiled successfully, while its
+  fresh UAC-gated launch could not be repeated from the non-elevated shell.
+- [x] Publish the unsigned installer and portable ZIP with the matching
+  SHA-256 manifest (`69D884AC6414E255ABC467A236D13F7B41EEC686137A6949F28E0753112D08BF`
+  and `2C21DDE0037339F46B4930B05A536175D7228762A6F53D5A32E7AA1D01F1D259`).
 
 ## Documentation maintenance
 

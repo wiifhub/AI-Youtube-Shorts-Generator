@@ -26,6 +26,16 @@ concurrency/path fixes completed on `main`.
       their intended ownership boundaries.
 - [x] Run the full local test/lint/type/security/package smoke gates and publish
       the verified Windows and Docker artifacts from the v1.0.1 tag.
+- [x] Record the v1.0.1 release evidence: 202 tests passed, 4 skipped, 68.46%
+      coverage; Quality Checks `36195605900`; Docker runs `36195605940` and
+      `36196233494`; and the portable payload smoke passed authenticated
+      shutdown and clean exit. The installer build succeeded, but its fresh
+      UAC-gated launch was not repeatable from the non-elevated release shell.
+- [x] Publish the unsigned, hash-verified installer and portable ZIP. The
+      installer SHA-256 is
+      `69D884AC6414E255ABC467A236D13F7B41EEC686137A6949F28E0753112D08BF` and
+      the portable ZIP SHA-256 is
+      `2C21DDE0037339F46B4930B05A536175D7228762A6F53D5A32E7AA1D01F1D259`.
 
 ---
 
