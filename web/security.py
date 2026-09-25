@@ -189,6 +189,41 @@ def redact_record_urls(record: Any) -> None:
     _redact_record_urls_in(record)
 
 
+def _redact_record_secrets_in(value: Any, values: Tuple[str, ...]) -> Any:
+    """Return one node of a record with known credential values replaced."""
+    if isinstance(value, str):
+        return _replace_secret_values(value, values) if values else value
+    if isinstance(value, dict):
+        for name, item in list(value.items()):
+            value[name] = _redact_record_secrets_in(item, values)
+        return value
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            value[index] = _redact_record_secrets_in(item, values)
+        return value
+    if isinstance(value, tuple):
+        return tuple(_redact_record_secrets_in(item, values) for item in value)
+    return value
+
+
+def redact_record_secrets(record: Any, secrets: Optional[Dict[str, str]] = None) -> None:
+    """Replace known credential values anywhere inside a record, in place.
+
+    The URL policy above only recognises a value that *is* an absolute URL.  A
+    credential the app itself holds also arrives as prose: a dependency that
+    narrates or echoes back the request it just rejected, or a provider payload
+    that lands in a result field.  The durable write path is the single owner of
+    what a record may contain, so it scrubs those values as well and no field
+    added later can leak by omission.  Only values the policy already knows are
+    credentials are replaced, so functional text is left byte-for-byte
+    unchanged.
+    """
+    values = _secret_values(secrets)
+    if not values:
+        return
+    _redact_record_secrets_in(record, values)
+
+
 def _redact_query_parameters(text: str) -> str:
     """Replace credential parameter values found anywhere in a string."""
 
@@ -210,6 +245,30 @@ def _configured_secrets() -> Tuple[str, ...]:
     return tuple(values)
 
 
+def _secret_values(secrets: Optional[Dict[str, str]] = None) -> Tuple[str, ...]:
+    """Return every credential value the policy knows about.
+
+    The configured environment values are always in scope, because a provider
+    error can echo whichever one the process is actually using; the caller's
+    map adds the session credentials that were never written to disk.
+    """
+    explicit = tuple(value for value in (secrets or {}).values() if isinstance(value, str))
+    return tuple(
+        secret for secret in (*_configured_secrets(), *explicit) if isinstance(secret, str) and len(secret) >= 4
+    )
+
+
+def _replace_secret_values(text: str, values: Tuple[str, ...]) -> str:
+    for secret in values:
+        text = text.replace(secret, "[redacted]")
+    return text
+
+
+def redact_secret_values(text: str, secrets: Optional[Dict[str, str]] = None) -> str:
+    """Replace every known credential value found anywhere in ``text``."""
+    return _replace_secret_values(text, _secret_values(secrets))
+
+
 def redact_text(value: Any, secrets: Optional[Dict[str, str]] = None, max_length: int = 4000) -> str:
     """Redact known provider formats and explicitly supplied session secrets."""
     text = str(value or "")
@@ -219,10 +278,7 @@ def redact_text(value: Any, secrets: Optional[Dict[str, str]] = None, max_length
     text = _redact_userinfo(text)
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub("[redacted]", text)
-    explicit = tuple(value for value in (secrets or {}).values() if isinstance(value, str))
-    for secret in (*_configured_secrets(), *explicit):
-        if isinstance(secret, str) and len(secret) >= 4:
-            text = text.replace(secret, "[redacted]")
+    text = _replace_secret_values(text, _secret_values(secrets))
     return text[:max_length]
 
 

@@ -82,6 +82,7 @@ from web.security import (  # noqa: E402
     rate_limit_key,
     rate_limit_response,
     rate_limit_shape,
+    redact_record_secrets,
     redact_record_urls,
     redact_structure,
     redact_text,
@@ -680,6 +681,11 @@ def _persist_job_locked(job: Dict[str, Any]) -> None:
     request_value = job.get("request") if isinstance(job.get("request"), dict) else {}
     fetch_url = request_value.get("url")
     redact_record_urls(job)
+    # A credential the app itself holds is not always URL-shaped: a dependency
+    # can echo one into a progress message or a result payload.  The same owner
+    # replaces those values, so the in-memory record and every copy written from
+    # it are scrubbed together under the lock the snapshots also take.
+    redact_record_secrets(job, _job_credentials.get(str(job.get("id") or "")))
     # Flag only the URL the fetch depends on.  A signed URL the provider hosted,
     # a caption or a project name keeps its resume and retry: refusing those
     # would block a project whose source is perfectly fetchable.
@@ -1622,6 +1628,7 @@ def _run_job(
                 job_state = _jobs[job_id]
                 created_at = job_state.get("created_at")
                 request_snapshot = dict(job_state.get("request") or {})
+                job_credentials_snapshot = dict(_job_credentials.get(job_id) or {})
             metadata = {
                 "job_id": job_id,
                 "created_at": created_at,
@@ -1635,6 +1642,7 @@ def _run_job(
             # through the same URL policy instead of trusting the pipeline's
             # echo of the source URL.
             redact_record_urls(metadata)
+            redact_record_secrets(metadata, job_credentials_snapshot)
             (job_output_dir / "metadata.json").write_text(
                 json.dumps(metadata, ensure_ascii=False, indent=2, default=str),
                 encoding="utf-8",

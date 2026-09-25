@@ -1556,3 +1556,185 @@ def test_basic_auth_source_never_reaches_a_saved_or_returned_copy(
     with studio._lock:
         assert studio._jobs[job_id]["status"] == "error"
     assert client.post(f"/api/jobs/{job_id}/retry").status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# A credential the app itself holds is not always URL-shaped
+# ---------------------------------------------------------------------------
+
+# Session keys arrive in headers, live only in memory, and can be echoed back
+# by the dependency that rejected them -- the exact case the text policy exists
+# for.  They are fake, and recognisable, so a byte scan can find one anywhere.
+_SESSION_MUAPI_KEY = "session_muapi_credential_1234567890"
+_SESSION_OPENAI_KEY = "session_openai_credential_0987654321"
+
+
+def _run_render(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    generator,
+    key: str,
+    narration: str,
+) -> str:
+    """Drive one real render through the API, with only the pipeline replaced.
+
+    Everything around the pipeline is production: the worker thread, the
+    ``progress`` writer, the completion write, the durable store and the
+    portable manifest.  The limiters are raised so the shared per-minute job
+    budget other tests spend cannot decide whether these assertions hold.
+    """
+    monkeypatch.setattr(studio, "_rate_limiter", SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "_upload_rate_limiter", SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "_job_rate_limiter", SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "MUAPI_API_KEY", "mu_test_key_1234567890")
+
+    def pipeline(**kwargs):
+        progress = kwargs.get("progress")
+        if progress:
+            progress("download", narration)
+        return generator()
+
+    monkeypatch.setattr(studio, "generate_shorts", pipeline)
+    response = client.post(
+        "/api/jobs",
+        headers={"X-MuAPI-Key": key, "X-OpenAI-Key": _SESSION_OPENAI_KEY},
+        json={"url": "https://youtu.be/aBcD1234", "mode": "api"},
+    )
+    assert response.status_code == 200
+    job_id = response.json()["id"]
+    deadline = time.time() + 30.0
+    status = ""
+    while time.time() < deadline:
+        with studio._lock:
+            status = str((studio._jobs.get(job_id) or {}).get("status"))
+        if status in {"done", "error", "cancelled"}:
+            return job_id
+        time.sleep(0.02)
+    raise AssertionError(f"render never reached a terminal state (status={status})")
+
+
+def _durable_copies(job_id: str) -> dict:
+    """Every copy a credential must not reach: record, mirror, store, manifest."""
+    copies = {
+        "record": json.dumps(studio._jobs.get(job_id), default=str, ensure_ascii=False).encode("utf-8"),
+        "mirror": studio._job_path(job_id).read_bytes(),
+    }
+    database = studio._jobs_db_path
+    for suffix in ("", "-wal", "-shm"):
+        path = database.with_name(database.name + suffix)
+        if path.is_file():
+            copies[f"sqlite{suffix or '-main'}"] = path.read_bytes()
+    manifest = studio._jobs_dir / job_id / "metadata.json"
+    if manifest.is_file():
+        copies["metadata"] = manifest.read_bytes()
+    return copies
+
+
+def _assert_credential_never_returned_or_stored(client: TestClient, job_id: str, key: str) -> None:
+    """Scan every returned view and every durable copy for the session key."""
+    for name, path in (
+        ("single", f"/api/jobs/{job_id}"),
+        ("grid", "/api/jobs"),
+        ("factory", f"/api/jobs/{job_id}/factory"),
+        ("timeline", f"/api/jobs/{job_id}/timeline"),
+        ("logs", f"/api/logs?job_id={job_id}"),
+        ("job_logs", f"/api/jobs/{job_id}/logs"),
+        ("export", f"/api/jobs/{job_id}/export"),
+        ("backup", "/api/backup?include_media=true"),
+    ):
+        response = client.get(path)
+        assert response.status_code == 200, name
+        assert key not in response.content.decode("utf-8", "ignore"), f"credential returned by {name}"
+    for name, blob in _durable_copies(job_id).items():
+        assert key not in blob.decode("utf-8", "ignore"), f"credential stored in {name}"
+
+
+def test_dependency_echo_in_a_progress_message_is_scrubbed_everywhere(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A narration that quotes the key must not persist one copy of it raw."""
+    key = _SESSION_MUAPI_KEY
+    narration = f"GET https://api.muapi.ai/v1/render?api_key={key} failed"
+    job_id = _run_render(
+        client,
+        monkeypatch,
+        lambda: {
+            "mode": "api",
+            "source_video_url": "https://cdn.example/v.mp4",
+            "shorts": [],
+            "transcript": {},
+        },
+        key,
+        narration,
+    )
+
+    with studio._lock:
+        checkpoint = json.dumps(studio._jobs[job_id]["checkpoint"], default=str)
+    assert key not in checkpoint
+    # Scrubbed, not dropped: the narration the user needs is still there.
+    assert "api_key=[redacted]" in checkpoint
+    _assert_credential_never_returned_or_stored(client, job_id, key)
+
+
+def test_dependency_payload_echo_is_scrubbed_from_every_copy(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider payload that echoes the key must not reach a result field raw."""
+    key = _SESSION_OPENAI_KEY
+    job_id = _run_render(
+        client,
+        monkeypatch,
+        lambda: {
+            "mode": "api",
+            "source_video_url": "https://cdn.example/v.mp4",
+            "highlights": [{"start": 0.0, "end": 1.0, "note": f"api_key={key}"}],
+            "shorts": [
+                {
+                    "index": 0,
+                    "title": f"clip echoing {key}",
+                    "start_time": 0.0,
+                    "end_time": 1.0,
+                    "virality_reason": f"provider said {key}",
+                }
+            ],
+            "transcript": {"segments": [{"start": 0.0, "end": 1.0, "text": f"said {key}"}]},
+            "llm": {"provider": "openai", "model": "x", "usage": {"api_key": key}},
+        },
+        key,
+        "Fetching source video...",
+    )
+
+    with studio._lock:
+        stored = json.dumps(studio._jobs[job_id], default=str)
+    assert key not in stored
+    # The payload is still readable; only the credential inside it is gone.
+    assert "clip echoing [redacted]" in stored
+    _assert_credential_never_returned_or_stored(client, job_id, key)
+
+
+def test_ordinary_narration_is_left_byte_for_byte(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The value policy must not rewrite a record that holds no credential."""
+    narration = "Cropping 3 of 10 candidates..."
+    job_id = _run_render(
+        client,
+        monkeypatch,
+        lambda: {
+            "mode": "api",
+            "source_video_url": "https://cdn.example/v.mp4",
+            "shorts": [],
+            "transcript": {},
+        },
+        _SESSION_MUAPI_KEY,
+        narration,
+    )
+
+    with studio._lock:
+        job = studio._jobs[job_id]
+        checkpoint_message = str(job["checkpoint"]["message"])
+        log_messages = [entry["message"] for entry in job["logs"]]
+    assert checkpoint_message == narration
+    assert narration in log_messages
+    mirror = studio._job_path(job_id).read_bytes()
+    assert narration.encode("utf-8") in mirror
+    # Nothing was rewritten, because nothing in the record was a credential.
+    assert b"[redacted]" not in mirror
