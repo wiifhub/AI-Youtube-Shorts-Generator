@@ -182,3 +182,65 @@ def test_youtube_upload_includes_category_thumbnail_and_captions(monkeypatch, tm
     assert calls[0][2]["json"]["snippet"]["categoryId"] == "27"
     assert calls[2][2]["headers"]["Content-Type"] == "image/png"
     assert calls[3][2]["json"]["snippet"]["language"] == "fr"
+
+
+def test_two_approvals_with_one_idempotency_key_upload_once(monkeypatch, tmp_path: Path) -> None:
+    """A duplicate approval must replay the cached upload, not send a second one.
+
+    The result cache is only written after the whole upload finishes, so two
+    approvals that overlap both miss it and both publish the same clip.
+    """
+    import threading
+    import time
+
+    publishing._upload_results.clear()
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"video-bytes")
+    monkeypatch.setattr(publishing, "_youtube_access_token", lambda: "access")
+    calls: list[str] = []
+    calls_lock = threading.Lock()
+    in_flight = threading.Event()
+
+    class Response:
+        def __init__(self, status_code: int, payload: dict | None = None, location: str = "") -> None:
+            self.status_code = status_code
+            self.headers = {"Location": location} if location else {}
+            self._payload = payload or {}
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._payload
+
+    def fake_request(method: str, url: str, **kwargs):
+        with calls_lock:
+            calls.append(method)
+        if method == "POST":
+            in_flight.set()
+            # Hold the upload open so the second approval inspects the cache
+            # while this one is still running.
+            time.sleep(0.5)
+            return Response(200, location="https://upload.example/session")
+        return Response(200, {"id": "video-1"})
+
+    monkeypatch.setattr(publishing, "_upload_request_with_retry", fake_request)
+
+    results: list[dict] = []
+
+    def upload() -> None:
+        results.append(
+            publishing.upload_youtube_video(media, title="Title", description="D", idempotency_key="dup")
+        )
+
+    first = threading.Thread(target=upload)
+    first.start()
+    assert in_flight.wait(timeout=5)
+    second = threading.Thread(target=upload)
+    second.start()
+    first.join(timeout=20)
+    second.join(timeout=20)
+
+    assert calls.count("POST") == 1
+    assert calls.count("PUT") == 1
+    assert [result["video_id"] for result in results] == ["video-1", "video-1"]

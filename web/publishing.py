@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 from email.utils import parsedate_to_datetime
+import functools
 import hashlib
 import os
 import secrets
@@ -125,6 +126,8 @@ _oauth_lock = threading.RLock()
 _oauth_states: Dict[str, Dict[str, Any]] = {}
 _youtube_tokens: Dict[str, Any] = {}
 _upload_results: Dict[str, Dict[str, Any]] = {}
+_upload_key_locks: Dict[str, threading.Lock] = {}
+_upload_key_locks_guard = threading.Lock()
 _OAUTH_STATE_TTL = 600.0
 _TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 _AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -483,6 +486,33 @@ def _upload_youtube_captions(
     return {"caption_id": caption_id, "language": language, "name": name, "draft": bool(draft), "status": "uploaded"}
 
 
+def _serialize_duplicate_upload(prefix: str):
+    """Run a direct upload under a per-idempotency-key lock.
+
+    Each adapter checks its result cache at entry and records the result only
+    after the network upload finishes, so two approvals carrying the same
+    idempotency key both miss the cache and both send.  Holding the key's lock
+    for the whole call makes that check-and-set atomic, so the duplicate waits
+    and then replays the cached result instead of uploading again.
+    """
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(media, *args, **kwargs):
+            request_key = str(kwargs.get("idempotency_key") or "").strip()[:160]
+            if not request_key:
+                return func(media, *args, **kwargs)
+            with _upload_key_locks_guard:
+                key_lock = _upload_key_locks.setdefault(f"{prefix}:{request_key}", threading.Lock())
+            with key_lock:
+                return func(media, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+@_serialize_duplicate_upload("key")
 def upload_youtube_video(
     media_path: str | Path,
     *,
@@ -875,6 +905,7 @@ def _instagram_access_token() -> str:
     return token
 
 
+@_serialize_duplicate_upload("tiktok")
 def publish_tiktok_video(
     media_path: str | Path,
     *,
@@ -959,6 +990,7 @@ def publish_tiktok_video(
     return result
 
 
+@_serialize_duplicate_upload("instagram")
 def publish_instagram_reel(
     media_url: str,
     *,
