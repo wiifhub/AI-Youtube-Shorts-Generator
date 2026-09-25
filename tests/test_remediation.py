@@ -522,3 +522,138 @@ def test_library_refresh_does_not_drain_the_batch_budget(
     )
     assert response.status_code == 200
     assert len(response.json()["jobs"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Source-URL fidelity versus credential scrubbing
+# ---------------------------------------------------------------------------
+
+
+def _capture_started(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Record the URL each render is actually handed."""
+    started: dict = {}
+    monkeypatch.setattr(
+        studio,
+        "_start_job_thread",
+        lambda job_id, req, *args, **kwargs: started.__setitem__(job_id, req.url),
+    )
+    return started
+
+
+def test_query_secret_matching_is_whole_name_only() -> None:
+    """Substring matching rewrote functional source URLs; whole names do not."""
+    for url in (
+        "https://cdn.example/v.mp4?key=abc123",
+        "https://cdn.example/v.mp4?author=bob&design=1",
+        "https://cdn.example/v.mp4?si=share&size=large",
+        "https://cdn.example/v.mp4?t=60#t=60",
+        "https://youtu.be/aBcD1234?si=SHARE&list=PL123",
+    ):
+        assert redact_url_query(url) == url
+
+    assert "X-Amz-Signature" not in redact_url_query("https://b.s3.amazonaws.com/k?X-Amz-Signature=deadbeef&id=1")
+    assert "SEKRET" not in redact_url_query("https://g.example/o?access_token=SEKRET&code=abc")
+    assert "SEKRET" not in redact_url_query("https://g.example/o?client_secret=SEKRET&client_id=1")
+    assert "FRAGSECRET" not in redact_url_query("https://x.example/cb#access_token=FRAGSECRET")
+    assert redact_text("open https://cdn.example/v.mp4?key=abc&author=bob").endswith("?key=abc&author=bob")
+
+
+def test_functional_source_url_survives_enqueue_persist_and_resume(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A working source URL must not be rewritten just for looking secret-ish."""
+    monkeypatch.setattr(studio, "MUAPI_API_KEY", "mu_test_key_1234567890")
+    url = "https://cdn.example/video.mp4?key=abc123&author=bob&design=1&si=share&size=large"
+    started = _capture_started(monkeypatch)
+
+    response = client.post("/api/jobs", json={"url": url, "mode": "api"})
+    assert response.status_code == 200
+    job_id = response.json()["id"]
+
+    # 1. handed to the renderer byte-for-byte
+    assert started[job_id] == url
+    assert response.json()["request"]["url"] == url
+
+    # 2. persisted byte-for-byte, in memory and in the portable mirror
+    with studio._lock:
+        assert studio._jobs[job_id]["request"]["url"] == url
+        assert studio._jobs[job_id]["source_url_redacted"] is False
+    mirror = json.loads((studio._jobs_dir / f"{job_id}.json").read_text(encoding="utf-8"))
+    assert mirror["request"]["url"] == url
+
+    # 3. resumed byte-for-byte
+    with studio._lock:
+        studio._jobs[job_id]["status"] = "interrupted"
+        studio._persist_job_locked(studio._jobs[job_id])
+    resumed = _capture_started(monkeypatch)
+    studio._resume_interrupted_jobs()
+    assert resumed[job_id] == url
+
+
+def test_provider_query_credentials_are_stripped_from_every_saved_copy(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(studio, "MUAPI_API_KEY", "mu_test_key_1234567890")
+    url = (
+        "https://bucket.s3.amazonaws.com/video.mp4"
+        "?X-Amz-Signature=deadbeefcafe&X-Amz-Credential=AKIAEXAMPLEKEY&access_token=OAUTHSECRET&id=7"
+        "#access_token=FRAGMENTSECRET"
+    )
+    started = _capture_started(monkeypatch)
+
+    response = client.post("/api/jobs", json={"url": url, "mode": "api"})
+    assert response.status_code == 200
+    job_id = response.json()["id"]
+    secrets = ("deadbeefcafe", "AKIAEXAMPLEKEY", "OAUTHSECRET", "FRAGMENTSECRET")
+
+    # The renderer still gets the URL it needs for the download to succeed.
+    assert started[job_id] == url
+
+    # No returned copy carries a credential value or name.
+    returned = json.dumps(response.json())
+    for secret in secrets:
+        assert secret not in returned
+    assert "access_token" not in returned
+
+    # Nor does the persisted record, which keeps the functional parameter.
+    with studio._lock:
+        job = studio._jobs[job_id]
+        stored = job["request"]["url"]
+        assert job["source_url_redacted"] is True
+    for secret in secrets:
+        assert secret not in stored
+    assert "access_token" not in stored
+    assert stored.endswith("?id=7")
+
+    mirror = (studio._jobs_dir / f"{job_id}.json").read_text(encoding="utf-8")
+    for secret in secrets:
+        assert secret not in mirror
+
+
+def test_redacted_source_url_is_never_reused_for_resume_or_retry(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(studio, "MUAPI_API_KEY", "mu_test_key_1234567890")
+    _capture_started(monkeypatch)
+    response = client.post(
+        "/api/jobs",
+        json={"url": "https://cdn.example/video.mp4?access_token=LEAKEDSECRET", "mode": "api"},
+    )
+    assert response.status_code == 200
+    job_id = response.json()["id"]
+
+    # Resume must refuse rather than fetch the stripped URL.
+    with studio._lock:
+        studio._jobs[job_id]["status"] = "interrupted"
+        studio._persist_job_locked(studio._jobs[job_id])
+    resumed = _capture_started(monkeypatch)
+    studio._resume_interrupted_jobs()
+    assert job_id not in resumed
+    with studio._lock:
+        assert studio._jobs[job_id]["status"] == "error"
+        assert "credentials" in str(studio._jobs[job_id]["message"])
+
+    # Retry must refuse for the same reason.
+    retry = client.post(f"/api/jobs/{job_id}/retry")
+    assert retry.status_code == 409
+    assert "credentials" in json.dumps(retry.json())

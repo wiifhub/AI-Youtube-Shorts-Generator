@@ -264,6 +264,7 @@ def duplicate_job(job_id: str) -> Dict[str, Any]:
         "archived": False,
         "logs": [{"t": now, "stage": "project", "message": "Duplicated from project " + job_id}],
         "request": copied_request.model_dump(),
+        "source_url_redacted": bool(source.get("source_url_redacted")),
     }
     with studio._lock:
         studio._jobs[new_id] = clone
@@ -343,6 +344,10 @@ def retry_job(
             raise HTTPException(409, "project is already running")
         if status not in {"error", "cancelled", "interrupted", "draft"}:
             raise HTTPException(409, "only failed, cancelled, interrupted, or draft projects can be retried")
+        # A stripped URL cannot be fetched, so retrying it would silently start a
+        # render against the wrong address; ask for the URL again instead.
+        if studio._source_url_was_redacted(job):
+            raise HTTPException(409, studio._SOURCE_URL_REDACTED_MESSAGE)
         request = studio._dict_value(job.get("request"))
     try:
         req = JobRequest.model_validate(request)

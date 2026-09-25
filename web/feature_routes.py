@@ -86,11 +86,10 @@ def _safe_backup_value(value: Any, key: str = "") -> Any:
     if isinstance(value, list):
         return [_safe_backup_value(item, key) for item in value]
     if isinstance(value, str) and (value.startswith("http://") or value.startswith("https://")):
-        # Shared policy: the secret query-key list lives in ``web.security`` so
-        # a new provider parameter cannot be scrubbed on one path and leak on
-        # another.  Backup exports also clear the fragment, and a URL with no
-        # safe form at all is dropped from the archive.
-        return redact_url_query(value, drop_fragment=True) or None
+        # Shared policy: the credential query-key list lives in ``web.security``
+        # so a new provider parameter cannot be scrubbed on one path and leak on
+        # another.  A URL with no safe form at all is dropped from the archive.
+        return redact_url_query(value) or None
     return value
 
 

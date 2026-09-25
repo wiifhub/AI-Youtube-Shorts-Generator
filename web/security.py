@@ -14,7 +14,7 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Deque, Dict, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -28,49 +28,80 @@ def error_response(message: str, code: str, status_code: int, **extra: Any) -> J
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\b(?:sk-[A-Za-z0-9_-]{8,}|sk-ant-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{8,}|mu_[A-Za-z0-9_-]{8,}|co_[A-Za-z0-9_-]{8,}|hf_[A-Za-z0-9_-]{8,})\b"),
     re.compile(r"(?i)\b(?:bearer|token|api[_ -]?key|secret)[=: ]+[A-Za-z0-9._~+/=-]{8,}"),
-    # URL query parameters are a common leak path for provider errors and
-    # echoed URLs: ``...?access_token=...&client_secret=...`` must never be
-    # returned to a client or written to a log.  The key part is matched
-    # loosely so underscored names (access_token, client_secret,
-    # X-Amz-Signature) are covered, not just bare ``token=``.
-    re.compile(r"(?i)(?:[?&])[\w.\-]*(?:token|secret|sig(?:nature)?|auth|credential|pass(?:word)?|api[_\-]?key|session)[\w.\-]*=[^&\s'\"<>]+"),
-    # AWS SigV4-style parameters on their own.
-    re.compile(r"(?i)(?:[?&])X-Amz-(?:Signature|Credential|Security-Token|SignedHeaders)=[^&\s'\"<>]+"),
 )
 
-# Query-parameter name fragments that mark a value as a credential. Matching is
-# case-insensitive and by substring so variants (token, AccessToken,
-# client_secret, X-Amz-Signature) are all caught when scrubbing URLs before
-# they are persisted or returned.
-_URL_SECRET_KEY_FRAGMENTS = ("token", "secret", "signature", "sig", "credential", "auth", "key", "password", "session", "jwt", "expir")
+# Query-parameter names that carry a credential.  Matching is on the *whole*
+# name (casefolded, with ``-``/``_``/``.`` removed) plus the unambiguous provider
+# signing namespaces, never on a substring: a substring rule also treats
+# functional parameters such as ``key``, ``author``, ``design``, ``si`` or
+# ``size`` as secrets, which silently rewrites a source URL the downloader
+# still needs.  Matching is shared by URL and free-text scrubbing so a new
+# provider parameter cannot be covered on one path and missed on another.
+_SECRET_QUERY_NAMES = frozenset(
+    (
+        "token", "accesstoken", "refreshtoken", "idtoken", "authtoken", "bearertoken", "securitytoken",
+        "sessiontoken", "sessionid", "session", "secret", "clientsecret", "apisecret", "secretkey",
+        "secretaccesskey", "password", "passwd", "pwd", "apikey", "accesskeyid", "awsaccesskeyid",
+        "googleaccessid", "signature", "sig", "signedheaders", "credential", "credentials", "credentialid",
+        "jwt", "assertion", "authorization", "auth", "expires", "expiry", "expire",
+    )
+)
+_SECRET_QUERY_PREFIXES = ("xamz", "xgoog")
+
+# One parameter matcher shared by URL and free-text scrubbing.  ``#`` is included
+# because implicit-flow tokens arrive in the fragment, not the query.
+_QUERY_PARAMETER_PATTERN = re.compile(r"(?i)([?&#])([\w.\-]+)=([^&\s'\"<>]*)")
 
 
 def _query_key_is_secret(name: str) -> bool:
-    folded = str(name).casefold()
-    return any(fragment in folded for fragment in _URL_SECRET_KEY_FRAGMENTS)
+    """True only for whole credential parameter names, never for substrings."""
+    folded = re.sub(r"[-_.]", "", str(name).casefold())
+    return folded in _SECRET_QUERY_NAMES or folded.startswith(_SECRET_QUERY_PREFIXES)
 
 
-def redact_url_query(value: str, *, drop_fragment: bool = False) -> str:
-    """Strip credential-looking query parameters from a URL.
+def _scrub_parameters(component: str) -> str:
+    """Drop credential parameters from a query or fragment, keeping the rest."""
+    if not component or "=" not in component:
+        return component
+    kept = [
+        (name, item)
+        for name, item in parse_qsl(component, keep_blank_values=True)
+        if not _query_key_is_secret(name)
+    ]
+    return urlencode(kept)
+
+
+def redact_url_query(value: str) -> str:
+    """Strip credential parameters from a URL's query *and* fragment.
 
     Long signed-URL parameters (S3, Azure, GCS, OAuth) routinely outlive the
-    request that produced them.  Anything that survives in a persisted job
-    record, a backup, or an API error message must not carry those values.
-    This is the single implementation of that policy: callers choose only
-    whether a ``#fragment`` may survive, because backup exports scrub
-    implicit-flow tokens carried in the fragment while job source URLs keep
-    theirs (``#t=60`` markers).
+    request that produced them, and implicit-flow tokens live in the fragment,
+    so anything surviving in a persisted job record, a backup, or an API error
+    message must not carry those values.  Non-credential parameters -- and a
+    URL with no credential parameters at all -- are returned byte-for-byte
+    unchanged so a legitimate source URL keeps working.
     """
-    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-
+    text = str(value or "")
     try:
-        parts = urlsplit(str(value or ""))
+        parts = urlsplit(text)
     except (TypeError, ValueError):
         return ""
-    if not parts.query and not (drop_fragment and parts.fragment):
-        return str(value or "")
-    query = [(name, item) for name, item in parse_qsl(parts.query, keep_blank_values=True) if not _query_key_is_secret(name)]
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
+    query = _scrub_parameters(parts.query)
+    fragment = _scrub_parameters(parts.fragment)
+    if query == parts.query and fragment == parts.fragment:
+        return text
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, fragment))
+
+
+def _redact_query_parameters(text: str) -> str:
+    """Replace credential parameter values found anywhere in a string."""
+
+    def replace(match: re.Match[str]) -> str:
+        if not _query_key_is_secret(match.group(2)):
+            return match.group(0)
+        return f"{match.group(1)}{match.group(2)}=[redacted]"
+
+    return _QUERY_PARAMETER_PATTERN.sub(replace, text)
 
 
 def _configured_secrets() -> Tuple[str, ...]:
@@ -88,6 +119,7 @@ def redact_text(value: Any, secrets: Optional[Dict[str, str]] = None, max_length
     text = str(value or "")
     if "://" in text:
         text = redact_url_query(text)
+    text = _redact_query_parameters(text)
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub("[redacted]", text)
     explicit = tuple(value for value in (secrets or {}).values() if isinstance(value, str))

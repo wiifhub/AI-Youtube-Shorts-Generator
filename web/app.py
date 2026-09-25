@@ -669,7 +669,12 @@ def _persist_job_locked(job: Dict[str, Any]) -> None:
     if isinstance(request_value, dict):
         url_value = request_value.get("url")
         if isinstance(url_value, str) and "://" in url_value:
-            request_value["url"] = redact_url_query(url_value)
+            safe_url = redact_url_query(url_value)
+            if safe_url != url_value:
+                request_value["url"] = safe_url
+                # Whatever stripped the credentials, the URL can no longer be
+                # fetched: flag it so resume and retry refuse the stripped form.
+                job["source_url_redacted"] = True
     _job_store.save(job)
     path = _job_path(str(job["id"]))
     temporary = path.with_suffix(".json.tmp")
@@ -1679,12 +1684,16 @@ def _enqueue_job(
         raise HTTPException(
             507, f"not enough free disk space ({free_gb:.2f} GB available; {_min_free_gb:.2f} GB required)"
         )
-    # Strip credential-bearing query parameters (signed media URLs, OAuth
-    # callbacks) before the URL is persisted, displayed, or used as a name.
-    if "://" in req.url:
-        req.url = redact_url_query(req.url.strip())
+    # The downloader keeps the URL exactly as supplied; only the durable copy is
+    # scrubbed of credential parameters, and the project name derives from that
+    # scrubbed form.  A URL that lost credentials can never be fetched again, so
+    # the record is flagged and resume/retry refuse it rather than silently
+    # downloading the stripped form.
+    fetch_url = req.url.strip()
+    stored_url = redact_url_query(fetch_url) if "://" in fetch_url else fetch_url
+    req.url = fetch_url
     job_id = uuid.uuid4().hex[:12]
-    default_name = re.sub(r"[^A-Za-z0-9 _-]+", " ", req.url.rsplit("/", 1)[-1]).strip()
+    default_name = re.sub(r"[^A-Za-z0-9 _-]+", " ", stored_url.rsplit("/", 1)[-1]).strip()
     default_name = " ".join(default_name.split())[:80] or "Untitled project"
     with _lock:
         _jobs[job_id] = {
@@ -1713,8 +1722,9 @@ def _enqueue_job(
             "created_at": time.time(),
             "updated_at": time.time(),
             "archived": False,
+            "source_url_redacted": stored_url != fetch_url,
             "request": {
-                "url": req.url.strip(),
+                "url": stored_url,
                 "mode": req.mode,
                 "num_clips": req.num_clips,
                 "aspect_ratio": req.aspect_ratio,
@@ -1769,6 +1779,17 @@ def _enqueue_job(
         return _job_snapshot(_jobs[job_id])
 
 
+_SOURCE_URL_REDACTED_MESSAGE = (
+    "This project's source URL carried credentials that are not stored, so it cannot be fetched again. "
+    "Submit the URL to start a new render."
+)
+
+
+def _source_url_was_redacted(job: Dict[str, Any]) -> bool:
+    """True when the stored source URL lost credentials and can no longer fetch."""
+    return bool(job.get("source_url_redacted"))
+
+
 def _resume_interrupted_jobs() -> None:
     pending: List[tuple[str, JobRequest]] = []
     with _lock:
@@ -1776,6 +1797,14 @@ def _resume_interrupted_jobs() -> None:
             if job.get("status") != "interrupted":
                 continue
             request = _dict_value(job.get("request"))
+            if _source_url_was_redacted(job):
+                job["status"] = "error"
+                job["stage"] = "error"
+                job["message"] = _SOURCE_URL_REDACTED_MESSAGE
+                job["error"] = job["message"]
+                _append_job_log(job, "error", job["message"])
+                _persist_job_locked(job)
+                continue
             try:
                 req = JobRequest.model_validate(request)
             except Exception as exc:
