@@ -129,11 +129,21 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
     studio = _studio()
     should_terminate = False
     queued_future = None
+    # The run this decision is about.  A retry accepted after this point owns a
+    # newer generation, so the pending terminate below leaves its render alone.
+    generation = None
     with studio._lock:
         job = studio._jobs.get(job_id)
         if not job:
             raise HTTPException(404, "job not found")
-        if job.get("status") in {"running", "queued"}:
+        status = str(job.get("status") or "unknown")
+        if status in {"running", "queued", "cancelled"}:
+            generation = studio._job_run_generation(job_id)
+        if status == "cancelled":
+            # A repeated cancel is an idempotent cleanup: the project is already
+            # cancelled, so nothing of its current run may keep rendering.
+            should_terminate = True
+        if status in {"running", "queued"}:
             job["status"] = "cancelled"
             job["stage"] = "cancelled"
             job["message"] = "Cancellation requested"
@@ -158,7 +168,7 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
                 if studio._job_futures.get(job_id) is queued_future:
                     studio._job_futures.pop(job_id, None)
     if should_terminate:
-        terminated = studio._terminate_job_processes(job_id)
+        terminated = studio._terminate_job_processes(job_id, generation)
         snapshot["terminated_processes"] = terminated
     return snapshot
 

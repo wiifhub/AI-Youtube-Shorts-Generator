@@ -246,6 +246,124 @@ def test_two_approvals_with_one_idempotency_key_upload_once(monkeypatch, tmp_pat
     assert [result["video_id"] for result in results] == ["video-1", "video-1"]
 
 
+def test_two_tiktok_approvals_with_one_key_upload_once(monkeypatch, tmp_path: Path) -> None:
+    """A duplicate TikTok approval must replay the cached upload.
+
+    The direct adapters check their result cache at entry and record it only
+    after the upload finishes, so without the per-key lock both approvals post
+    the same clip.
+    """
+    import threading
+    import time
+
+    publishing._upload_results.clear()
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"video-bytes")
+    monkeypatch.setattr(publishing, "_tiktok_access_token", lambda: "access")
+    calls: list[str] = []
+    calls_lock = threading.Lock()
+    in_flight = threading.Event()
+
+    class Response:
+        def __init__(self, status_code: int, payload: dict | None = None) -> None:
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._payload
+
+    def fake_request(method: str, url: str, **kwargs):
+        with calls_lock:
+            calls.append(method)
+        if method == "POST":
+            in_flight.set()
+            time.sleep(0.5)
+            return Response(200, {"data": {"upload_url": "https://upload.example/tiktok", "publish_id": "pub-1"}})
+        return Response(201)
+
+    monkeypatch.setattr(publishing, "_social_request_with_retry", fake_request)
+    results: list[dict] = []
+
+    def upload() -> None:
+        results.append(publishing.publish_tiktok_video(media, title="Title", idempotency_key="dup"))
+
+    first = threading.Thread(target=upload)
+    first.start()
+    assert in_flight.wait(timeout=5)
+    second = threading.Thread(target=upload)
+    second.start()
+    first.join(timeout=20)
+    second.join(timeout=20)
+
+    assert calls.count("POST") == 1
+    assert calls.count("PUT") == 1
+    assert [result["publish_id"] for result in results] == ["pub-1", "pub-1"]
+
+
+def test_two_instagram_approvals_with_one_key_publish_once(monkeypatch) -> None:
+    """A duplicate Reel approval must replay the cached publish."""
+    import threading
+    import time
+
+    publishing._upload_results.clear()
+    monkeypatch.setattr(publishing, "_instagram_access_token", lambda: "access")
+    monkeypatch.setattr(
+        publishing,
+        "instagram_oauth_config",
+        lambda: {"app_id": "app", "app_secret": "secret", "user_id": "1789", "graph_version": "v25.0"},
+    )
+    calls: list[str] = []
+    calls_lock = threading.Lock()
+    in_flight = threading.Event()
+
+    class Response:
+        def __init__(self, payload: dict | None = None) -> None:
+            self.status_code = 200
+            self._payload = payload or {}
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._payload
+
+    def fake_request(method: str, url: str, **kwargs):
+        with calls_lock:
+            calls.append(f"{method} {url.rsplit('/', 1)[-1]}")
+        if url.endswith("/media"):
+            in_flight.set()
+            time.sleep(0.5)
+            return Response({"id": "container-1"})
+        if url.endswith("/media_publish"):
+            return Response({"id": "media-1"})
+        return Response({"status_code": "FINISHED"})
+
+    monkeypatch.setattr(publishing, "_social_request_with_retry", fake_request)
+    results: list[dict] = []
+
+    def publish() -> None:
+        results.append(
+            publishing.publish_instagram_reel(
+                "https://cdn.example/clip.mp4", caption="Caption", idempotency_key="dup", poll_interval=0.0
+            )
+        )
+
+    first = threading.Thread(target=publish)
+    first.start()
+    assert in_flight.wait(timeout=5)
+    second = threading.Thread(target=publish)
+    second.start()
+    first.join(timeout=20)
+    second.join(timeout=20)
+
+    assert calls.count("POST media") == 1
+    assert calls.count("POST media_publish") == 1
+    assert [result["media_id"] for result in results] == ["media-1", "media-1"]
+
+
 def test_publish_idempotency_locks_stay_bounded() -> None:
     """One retained lock per publish key would grow with every upload ever made.
 

@@ -305,7 +305,11 @@ _max_queued_jobs = _positive_int_env("SHORTS_MAX_QUEUED_JOBS", 64)
 # buffer an unbounded number of pending jobs in process memory.
 _job_queue_slots = threading.BoundedSemaphore(_max_concurrent_jobs + _max_queued_jobs)
 _process_lock = threading.RLock()
-_job_processes: Dict[str, Dict[int, Any]] = {}
+# ``pid -> (run generation, process)``.  A project can be cancelled and retried
+# concurrently, so a termination decision has to name the run it was made about;
+# without that the pending cancel of one run kills the next run's render.
+_job_processes: Dict[str, Dict[int, Tuple[int, Any]]] = {}
+_job_run_generations: Dict[str, int] = {}
 _shutdown_requested = threading.Event()
 _bound_server: Any = None
 _media_slots = threading.Semaphore(_positive_int_env("SHORTS_MAX_MEDIA_OPERATIONS", 2))
@@ -1432,6 +1436,26 @@ def _shutdown_job_executor() -> None:
         executor.shutdown(wait=True, cancel_futures=True)
 
 
+def _begin_job_run(job_id: str) -> int:
+    """Claim a fresh generation for the next run of one project.
+
+    Every path that hands a project to the worker pool calls this before the
+    render can start, so each run's children are tagged with a generation of
+    their own and a termination decision can be scoped to the run it was made
+    about.  Guarded by the process registry's lock, which the tagging reads.
+    """
+    with _process_lock:
+        generation = _job_run_generations.get(job_id, 0) + 1
+        _job_run_generations[job_id] = generation
+        return generation
+
+
+def _job_run_generation(job_id: str) -> int:
+    """Return the generation of the run a project currently describes."""
+    with _process_lock:
+        return _job_run_generations.get(job_id, 0)
+
+
 def _register_job_process(job_id: str, process: Any) -> None:
     """Track a render child so cancellation can terminate FFmpeg promptly."""
     try:
@@ -1439,7 +1463,8 @@ def _register_job_process(job_id: str, process: Any) -> None:
     except (AttributeError, TypeError, ValueError):
         return
     with _process_lock:
-        _job_processes.setdefault(job_id, {})[pid] = process
+        generation = _job_run_generations.get(job_id, 0)
+        _job_processes.setdefault(job_id, {})[pid] = (generation, process)
 
 
 def _unregister_job_process(job_id: str, process: Any) -> None:
@@ -1456,10 +1481,28 @@ def _unregister_job_process(job_id: str, process: Any) -> None:
             _job_processes.pop(job_id, None)
 
 
-def _terminate_job_processes(job_id: str) -> int:
-    """Terminate all child processes belonging to a job and return a count."""
+def _terminate_job_processes(job_id: str, generation: Optional[int] = None) -> int:
+    """Terminate a project's render children and return how many were killed.
+
+    ``generation`` scopes the kill to the run the caller decided about, so a
+    retry that started in the meantime keeps its render.  ``None`` means every
+    run the project currently has, which is what a renderer stopping itself, a
+    timeout, and shutdown all want.
+    """
     with _process_lock:
-        processes = list((_job_processes.get(job_id) or {}).values())
+        registered = dict(_job_processes.get(job_id) or {})
+        if generation is None:
+            selected = registered
+        else:
+            selected = {pid: entry for pid, entry in registered.items() if entry[0] == generation}
+        processes = [entry[1] for entry in selected.values()]
+        # Only the run that was terminated is forgotten: the entries a newer
+        # run registered are still needed by its own cancellation checks.
+        remaining = {pid: entry for pid, entry in registered.items() if pid not in selected}
+        if remaining:
+            _job_processes[job_id] = remaining
+        else:
+            _job_processes.pop(job_id, None)
     terminated = 0
     for process in processes:
         try:
@@ -1479,8 +1522,6 @@ def _terminate_job_processes(job_id: str) -> int:
                 process.wait(timeout=1.0)
             except (AttributeError, OSError, ProcessLookupError, subprocess.TimeoutExpired):
                 pass
-    with _process_lock:
-        _job_processes.pop(job_id, None)
     return terminated
 
 
@@ -1505,6 +1546,9 @@ def _start_job_thread(
     if not _job_queue_slots.acquire(timeout=2.0):
         _mark_submission_rejected(job_id, cleanup_on_reject=cleanup_on_reject)
         raise HTTPException(429, "Too many queued projects; wait for current renders to finish")
+    # Claim the run's generation before the worker can register a child, so a
+    # cancel decided about the previous run can never reach this one's children.
+    _begin_job_run(job_id)
     try:
         future = _ensure_job_executor().submit(_run_job, job_id, req, dict(credentials or {}))
     except RuntimeError:
