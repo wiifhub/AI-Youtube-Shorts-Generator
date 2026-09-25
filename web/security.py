@@ -434,6 +434,61 @@ def is_safe_open_url(url: str, *, allowed_schemes: Tuple[str, ...] = ("https",))
     return True
 
 
+def configured_bind_host() -> str:
+    """Return the address this server is configured to listen on."""
+    return os.getenv("SHORTS_BIND_HOST", "127.0.0.1").strip().lower()
+
+
+def binds_to_loopback() -> bool:
+    """True when the configured bind is the one-click loopback desktop build.
+
+    That build intentionally runs without a token, so it must also refuse the
+    browser-driven request shapes a hostile page can produce; a deployment bound
+    to a network address is authenticated instead and keeps its endpoints.
+    """
+    host = configured_bind_host().strip().strip("[]")
+    return host in {"", "localhost"} or host_is_loopback(host)
+
+
+def _request_host_name(request: Request) -> str:
+    """Return the ``Host`` header's hostname without its port."""
+    host = str(request.headers.get("host") or "").strip().lower()
+    if not host:
+        return ""
+    if host.startswith("["):
+        closing = host.find("]")
+        name = host[1:closing] if closing != -1 else host[1:]
+    elif host.count(":") == 1:
+        name = host.rsplit(":", 1)[0]
+    else:
+        name = host
+    return name.rstrip(".").strip("[]")
+
+
+def is_allowed_request_host(request: Request) -> bool:
+    """Refuse a foreign ``Host`` when this server is loopback-bound.
+
+    A page on an attacker-controlled name that resolves to 127.0.0.1 makes the
+    browser treat the app as same-origin (DNS rebinding), which defeats the
+    same-origin rule below and ``SameSite`` cookies, and lets the page read
+    project data.  A loopback-bound server only ever answers a loopback name for
+    a real client, so any other name is refused; a deployment bound to a network
+    address is unchanged because its clients legitimately use another name.
+
+    ``X-Forwarded-Host`` is deliberately not consulted: a browser cannot set it
+    without a preflight, and the proxy that legitimately sets it reaches the app
+    on a non-loopback bind, where this rule does not apply.  Serving a loopback
+    bind under another public name is what ``SHORTS_BIND_HOST`` is for, and
+    setting it also makes the startup guard require a token.
+    """
+    if not binds_to_loopback():
+        return True
+    name = _request_host_name(request)
+    if not name:
+        return True
+    return name == "localhost" or host_is_loopback(name)
+
+
 def is_safe_request_origin(request: Request) -> bool:
     """Decide whether a mutation may proceed when session-cookie authenticated.
 
@@ -475,6 +530,28 @@ def session_cookie_valid(request: Request) -> bool:
     return verify_session_token(
         request.cookies.get("shorts_token", ""),
         request.cookies.get("shorts_csrf"),
+    )
+
+
+def header_credential_valid(request: Request) -> bool:
+    """True only when the request presents the configured token in a header.
+
+    Distinct from :func:`bearer_authorized`, which treats a server with no token
+    configured as authorized: here an unconfigured server has nothing to
+    present, so no request is exempt.  Used to keep non-browser API clients out
+    of the browser-focused same-origin rule, because a page cannot read the
+    token and therefore cannot forge such a request.
+    """
+    expected = configured_token()
+    if not expected:
+        return False
+    candidates = _candidate_tokens(request)
+    if not candidates:
+        return False
+    expected_digest = hashlib.sha256(expected.encode("utf-8")).digest()
+    return any(
+        hmac.compare_digest(hashlib.sha256(candidate.encode("utf-8")).digest(), expected_digest)
+        for candidate in candidates
     )
 
 

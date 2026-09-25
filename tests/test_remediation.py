@@ -35,6 +35,11 @@ from web.security import (
     verify_session_token,
 )
 
+# A loopback-bound app refuses a foreign ``Host``, so the test client has to
+# speak as a real browser on this machine would, and same-origin headers must
+# name that same authority.
+LOOPBACK_BASE_URL = "http://127.0.0.1"
+
 
 @pytest.fixture()
 def client() -> TestClient:
@@ -43,7 +48,7 @@ def client() -> TestClient:
         studio._job_credentials.clear()
         studio._cancel_events.clear()
         studio._job_futures.clear()
-    with TestClient(studio.app) as test_client:
+    with TestClient(studio.app, base_url=LOOPBACK_BASE_URL) as test_client:
         yield test_client
     with studio._lock:
         studio._jobs.clear()
@@ -194,7 +199,7 @@ def test_bearer_token_still_accepted_and_cookie_is_not_bearer(client: TestClient
 def test_csrf_double_submit_required_for_cookie_mutations(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHORTS_API_TOKEN", "csrf-token")
     csrf = _login(client, "csrf-token")
-    origin = {"Origin": "http://testserver"}
+    origin = {"Origin": LOOPBACK_BASE_URL}
 
     missing = client.post("/api/setup/dismiss", headers=dict(origin), json={"dismissed": True})
     assert missing.status_code == 403
@@ -498,7 +503,7 @@ def test_plain_http_lan_bind_login_keeps_a_usable_cookie(client: TestClient, mon
 def test_https_login_cookie_is_secure(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHORTS_API_TOKEN", "tls-token")
     monkeypatch.delenv("SHORTS_COOKIE_SECURE", raising=False)
-    with TestClient(studio.app, base_url="https://testserver") as tls_client:
+    with TestClient(studio.app, base_url="https://127.0.0.1") as tls_client:
         response = tls_client.post("/api/auth/login", json={"token": "tls-token"})
     assert response.status_code == 200
     assert "Secure" in response.headers.get("set-cookie", "")
@@ -1822,7 +1827,7 @@ def test_unnameable_project_id_is_not_a_server_error(client: TestClient, job_id:
     raised a bare ``ValueError``, which reached the client as a 500 and logged a
     stack trace for a request anybody can send.
     """
-    with TestClient(studio.app, raise_server_exceptions=False) as tolerating:
+    with TestClient(studio.app, base_url=LOOPBACK_BASE_URL, raise_server_exceptions=False) as tolerating:
         deleted = tolerating.delete(f"/api/jobs/{job_id}")
         restored = tolerating.post(f"/api/jobs/{job_id}/restore")
     assert deleted.status_code == 404, deleted.text

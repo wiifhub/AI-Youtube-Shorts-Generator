@@ -73,9 +73,12 @@ from web.security import (  # noqa: E402
     auth_enabled,
     authorized,
     bearer_authorized,
+    binds_to_loopback,
     client_key,
+    configured_bind_host,
     error_response,
-    host_is_loopback,
+    header_credential_valid,
+    is_allowed_request_host,
     is_safe_request_origin,
     job_budget_bucket,
     make_rate_limiter,
@@ -491,19 +494,25 @@ async def security_middleware(request: Request, call_next: Any):
     (Origin/Referer) and CSRF double-submit checks below.
     """
     path = request.url.path
+    # A rebound name resolves to this server, so the browser would treat it as
+    # same-origin.  Refuse it before anything else sees the request.
+    if not is_allowed_request_host(request):
+        return error_response("Cross-site mutation blocked", "csrf_failed", 403)
     public = path in {"/api/health", "/healthz", "/api/auth/status", "/api/auth/login"} or not path.startswith("/api/")
     if auth_enabled() and not public and not authorized(request):
         return error_response("Authentication required", "auth_required", 401)
-    if (
-        auth_enabled()
-        and request.method.upper() in MUTATING_METHODS
-        and request.cookies.get("shorts_token")
+    mutating = request.method.upper() in MUTATING_METHODS
+    # A browser always identifies a cross-site mutation with Origin (or Referer
+    # alone), and a hostile page cannot omit it.  This rule therefore holds even
+    # when the loopback build runs without a token, where the auth-gated checks
+    # below never ran at all: only a caller that actually presents the configured
+    # token in a header is not a browser context and stays exempt.
+    browser_origin = request.headers.get("origin") or request.headers.get("referer")
+    if mutating and browser_origin and not header_credential_valid(request) and not is_safe_request_origin(request):
+        return error_response("Cross-site mutation blocked", "csrf_failed", 403)
+    if auth_enabled() and mutating and request.cookies.get("shorts_token") and not bearer_authorized(request):
         # Bearer-authenticated callers are not cookie-authenticated and stay
-        # exempt from the browser-focused CSRF controls.
-        and not bearer_authorized(request)
-    ):
-        if not is_safe_request_origin(request):
-            return error_response("Cross-site mutation blocked", "csrf_failed", 403)
+        # exempt from the double-submit control.
         submitted = request.headers.get("x-csrf-token", "").strip()
         cookie_csrf = str(request.cookies.get("shorts_csrf") or "")
         if not submitted or not hmac.compare_digest(submitted, cookie_csrf):
@@ -2303,8 +2312,8 @@ def _validate_remote_security_configuration() -> None:
     loopback bind in that setup still requires the token because the app
     itself is the trust boundary for API access.
     """
-    host = os.getenv("SHORTS_BIND_HOST", "127.0.0.1").strip().lower()
-    if host in {"", "localhost"} or host_is_loopback(host):
+    host = configured_bind_host()
+    if binds_to_loopback():
         return
     if auth_enabled():
         return

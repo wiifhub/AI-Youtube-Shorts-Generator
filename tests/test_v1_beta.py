@@ -23,7 +23,9 @@ def _client() -> TestClient:
         studio._jobs.clear()
         studio._job_store.clear()
     studio._clear_response_cache()
-    return TestClient(studio.app)
+    # A loopback-bound app refuses a foreign ``Host``, so the test client must
+    # speak as a real browser on this machine would.
+    return TestClient(studio.app, base_url="http://127.0.0.1")
 
 
 def test_v1_alias_error_catalog_and_legacy_deprecation() -> None:

@@ -20,6 +20,10 @@ from fastapi.testclient import TestClient
 import web.app as studio
 from web.feature_routes import backup_projects
 
+# The packaged app serves a loopback bind and refuses a foreign ``Host``, so
+# the test client must speak as a real browser on this machine would.
+LOOPBACK_BASE_URL = "http://127.0.0.1"
+
 
 @pytest.fixture()
 def client() -> TestClient:
@@ -28,7 +32,7 @@ def client() -> TestClient:
         studio._job_credentials.clear()
         studio._cancel_events.clear()
         studio._job_futures.clear()
-    with TestClient(studio.app) as test_client:
+    with TestClient(studio.app, base_url=LOOPBACK_BASE_URL) as test_client:
         yield test_client
     with studio._lock:
         studio._jobs.clear()
