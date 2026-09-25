@@ -237,6 +237,30 @@ def test_a_token_presented_in_a_header_is_not_a_browser_request(client, monkeypa
     assert _job_status(job_id) == "cancelled"
 
 
+def test_an_authenticated_deployment_may_serve_its_public_host(monkeypatch) -> None:
+    """The documented way to put TLS or a proxy in front of the app is to
+    forward to a loopback bind under the public name; the token is the boundary
+    in that configuration, so the name in ``Host`` must not refuse it.  The same
+    request without the token is still answered with nothing."""
+    monkeypatch.setenv("SHORTS_API_TOKEN", "deploy-token")
+    with TestClient(studio.app, base_url="http://studio.internal") as deployment:
+        job_id = _fabricate_job()
+        try:
+            authenticated = deployment.get(
+                "/api/jobs", headers={"Authorization": "Bearer deploy-token", "Host": "app.example.com"}
+            )
+            assert authenticated.status_code == 200, authenticated.text
+            assert job_id in authenticated.text
+
+            anonymous = deployment.get("/api/jobs", headers={"Host": "app.example.com"})
+            assert anonymous.status_code == 401, anonymous.text
+            assert job_id not in anonymous.text
+        finally:
+            with studio._lock:
+                studio._jobs.pop(job_id, None)
+                studio._cancel_events.pop(job_id, None)
+
+
 def test_a_network_bind_keeps_serving_its_real_hostname(monkeypatch) -> None:
     """Only the loopback build refuses a foreign Host; a deployment bound to a
     network address is authenticated and keeps the name its users type."""

@@ -450,6 +450,20 @@ def binds_to_loopback() -> bool:
     return host in {"", "localhost"} or host_is_loopback(host)
 
 
+def unauthenticated_loopback_build() -> bool:
+    """True only for the configuration with no other boundary at all.
+
+    The desktop build binds loopback and ships without a token, so a rebound
+    name is same-origin, cookie-less, and unauthenticated at the same time; the
+    ``Host`` rule below is the only thing left.  Once a token is configured,
+    every non-public route requires it and the session cookie is host-scoped, so
+    a rebound page gains nothing and the name in ``Host`` stops being a
+    boundary -- which matters because the documented way to put TLS or a proxy
+    in front of the app is to forward to a loopback bind under the public name.
+    """
+    return binds_to_loopback() and not auth_enabled()
+
+
 def _request_host_name(request: Request) -> str:
     """Return the ``Host`` header's hostname without its port."""
     host = str(request.headers.get("host") or "").strip().lower()
@@ -475,13 +489,15 @@ def is_allowed_request_host(request: Request) -> bool:
     a real client, so any other name is refused; a deployment bound to a network
     address is unchanged because its clients legitimately use another name.
 
+    Only :func:`unauthenticated_loopback_build` is constrained: an
+    authenticated deployment may legitimately be reached under another name, and
+    its token plus host-scoped cookies already cover what this rule covers here.
+
     ``X-Forwarded-Host`` is deliberately not consulted: a browser cannot set it
     without a preflight, and the proxy that legitimately sets it reaches the app
-    on a non-loopback bind, where this rule does not apply.  Serving a loopback
-    bind under another public name is what ``SHORTS_BIND_HOST`` is for, and
-    setting it also makes the startup guard require a token.
+    behind its own authentication.
     """
-    if not binds_to_loopback():
+    if not unauthenticated_loopback_build():
         return True
     name = _request_host_name(request)
     if not name:
