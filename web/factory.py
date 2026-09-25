@@ -11,9 +11,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, List
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunsplit
+from urllib.parse import urlparse
 
 from web.publishing import PLATFORMS, build_publish_plan, direct_platform_status
+from web.security import redact_url_query
 
 
 FACTORY_PACKAGE_VERSION = "1.0"
@@ -75,10 +76,9 @@ def _source_descriptor(request: Dict[str, Any]) -> Dict[str, Any]:
     raw = str(request.get("url") or "").strip()
     parsed = urlparse(raw)
     if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
-        secret_keys = {"token", "access_token", "signature", "sig", "expires", "expiry", "auth"}
-        query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key.casefold() not in secret_keys]
-        safe_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), ""))
-        return {"kind": "url", "value": safe_url}
+        # One credential policy for the whole app: a narrower list here would let
+        # a parameter scrubbed on one path leak on another.
+        return {"kind": "url", "value": redact_url_query(raw)}
     name = Path(raw).name if raw else ""
     kind = "upload" if "uploads" in {part.casefold() for part in Path(raw).parts} else "local_file"
     return {"kind": kind, "name": name or "source"}

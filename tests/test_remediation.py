@@ -558,6 +558,149 @@ def test_query_secret_matching_is_whole_name_only() -> None:
     assert redact_text("open https://cdn.example/v.mp4?key=abc&author=bob").endswith("?key=abc&author=bob")
 
 
+# Realistic source URLs whose parameters *look* credential-ish but are part of
+# how the source is fetched.  Each one is a shape an over-broad rule already
+# broke once: ``si``/``t``/``list`` are share and seek parameters, ``size`` is a
+# rendition hint, and a self-hosted ``key`` is an application-level accessor.
+_FUNCTIONAL_SOURCE_URLS = (
+    pytest.param("https://www.youtube.com/watch?v=aBcD1234&si=SHARE_TOKEN&t=60", id="youtube-share"),
+    pytest.param("https://youtu.be/aBcD1234?si=SHARE&list=PL123&size=large", id="youtube-playlist"),
+    pytest.param("https://vimeo.com/123456789?share=copy&size=large", id="vimeo-share"),
+    pytest.param("https://vimeo.com/123456789#t=60", id="vimeo-time-fragment"),
+    pytest.param("https://self-hosted.example/media/clip.mp4?key=abc123&author=bob", id="self-hosted-key"),
+)
+
+# The same download shapes carrying a real credential: the renderer must still
+# receive the signed URL, while every saved/returned copy loses the secret but
+# keeps any functional parameter.  ``gone`` are substrings that must appear in
+# no returned or persisted copy (parameter names as well as values).
+_CREDENTIAL_SOURCE_URLS = (
+    pytest.param(
+        "https://bucket.s3.us-east-1.amazonaws.com/video.mp4"
+        "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Credential=AKIAEXAMPLE%2F20260924%2Fus-east-1%2Fs3%2Faws4_request"
+        "&X-Amz-Date=20260924T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host"
+        "&X-Amz-Signature=deadbeefcafe",
+        "https://bucket.s3.us-east-1.amazonaws.com/video.mp4",
+        ("X-Amz-", "AKIAEXAMPLE", "deadbeefcafe"),
+        id="presigned-s3",
+    ),
+    pytest.param(
+        "https://storage.googleapis.com/b/video.mp4"
+        "?X-Goog-Algorithm=GOOG4-RSA-SHA256"
+        "&X-Goog-Credential=svc%40proj.iam.gserviceaccount.com%2F20260924"
+        "&X-Goog-Date=20260924T000000Z&X-Goog-Expires=900&X-Goog-Signature=feedfacecafe",
+        "https://storage.googleapis.com/b/video.mp4",
+        ("X-Goog-", "iam.gserviceaccount.com", "feedfacecafe"),
+        id="signed-gcs",
+    ),
+    pytest.param(
+        "https://customer-abc.cloudflarestream.com/manifest/video.m3u8?token=CFSTREAMTOKEN123",
+        "https://customer-abc.cloudflarestream.com/manifest/video.m3u8",
+        ("token=", "CFSTREAMTOKEN123"),
+        id="cloudflare-stream-token",
+    ),
+    pytest.param(
+        "https://self-hosted.example/media/clip.mp4?key=abc123&viewer=bob&X-Amz-Signature=deadbeefcafe",
+        "https://self-hosted.example/media/clip.mp4?key=abc123&viewer=bob",
+        ("X-Amz-Signature", "deadbeefcafe"),
+        id="self-hosted-key-plus-signature",
+    ),
+)
+
+
+@pytest.mark.parametrize("url", _FUNCTIONAL_SOURCE_URLS)
+def test_realistic_functional_source_urls_survive_byte_for_byte(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    """A functional source URL must reach the renderer and persist untouched."""
+    monkeypatch.setattr(studio, "MUAPI_API_KEY", "mu_test_key_1234567890")
+    started = _capture_started(monkeypatch)
+
+    response = client.post("/api/jobs", json={"url": url, "mode": "api"})
+    assert response.status_code == 200
+    job_id = response.json()["id"]
+
+    assert started[job_id] == url
+    assert response.json()["request"]["url"] == url
+
+    with studio._lock:
+        job = studio._jobs[job_id]
+        assert job["request"]["url"] == url
+        assert job["source_url_redacted"] is False
+
+    mirror = json.loads((studio._jobs_dir / f"{job_id}.json").read_text(encoding="utf-8"))
+    assert mirror["request"]["url"] == url
+
+
+@pytest.mark.parametrize("url, persisted, gone", _CREDENTIAL_SOURCE_URLS)
+def test_realistic_signed_source_urls_lose_credentials_in_every_saved_copy(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, url: str, persisted: str, gone: tuple
+) -> None:
+    """Signed download URLs keep working but persist without their credential."""
+    monkeypatch.setattr(studio, "MUAPI_API_KEY", "mu_test_key_1234567890")
+    started = _capture_started(monkeypatch)
+
+    response = client.post("/api/jobs", json={"url": url, "mode": "api"})
+    assert response.status_code == 200
+    job_id = response.json()["id"]
+
+    # The renderer still gets the URL the download needs to succeed.
+    assert started[job_id] == url
+
+    returned = json.dumps(response.json())
+    with studio._lock:
+        job = studio._jobs[job_id]
+        stored = job["request"]["url"]
+        assert job["source_url_redacted"] is True
+    mirror = (studio._jobs_dir / f"{job_id}.json").read_text(encoding="utf-8")
+
+    for secret in gone:
+        assert secret not in returned
+        assert secret not in stored
+        assert secret not in mirror
+    # The functional remainder is kept, not emptied out with the credential.
+    assert stored == persisted
+    assert persisted in returned
+    assert json.dumps(persisted)[1:-1] in mirror
+
+
+def test_factory_manifest_source_reads_the_shared_credential_policy(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The manifest must not carry a narrower credential list of its own."""
+    monkeypatch.setattr(studio, "MUAPI_API_KEY", "mu_test_key_1234567890")
+    _capture_started(monkeypatch)
+
+    # A seek offset in the fragment is functional, not a credential.
+    functional = "https://www.youtube.com/watch?v=aBcD1234&si=SHARE&t=60#t=60"
+    shared_id = client.post("/api/jobs", json={"url": functional, "mode": "api"}).json()["id"]
+    shared = client.get(f"/api/v1/jobs/{shared_id}/factory")
+    assert shared.status_code == 200
+    assert shared.json()["source"] == {"kind": "url", "value": functional}
+
+    # An implicit-flow token living only in the fragment is a credential.
+    fragment = "https://x.example/cb#access_token=FRAGSECRET"
+    fragment_id = client.post("/api/jobs", json={"url": fragment, "mode": "api"}).json()["id"]
+    fragment_source = client.get(f"/api/v1/jobs/{fragment_id}/factory").json()["source"]
+    assert fragment_source == {"kind": "url", "value": "https://x.example/cb"}
+
+    signed = (
+        "https://bucket.s3.amazonaws.com/video.mp4"
+        "?X-Amz-Signature=deadbeefcafe&X-Amz-Credential=AKIAEXAMPLE&X-Amz-Expires=900"
+    )
+    signed_id = client.post("/api/jobs", json={"url": signed, "mode": "api"}).json()["id"]
+    package = client.get(f"/api/v1/jobs/{signed_id}/factory")
+    assert package.status_code == 200
+    body = json.dumps(package.json())
+    for leaked in ("X-Amz-", "deadbeefcafe", "AKIAEXAMPLE"):
+        assert leaked not in body
+    assert package.json()["source"] == {
+        "kind": "url",
+        "value": "https://bucket.s3.amazonaws.com/video.mp4",
+    }
+
+
 def test_functional_source_url_survives_enqueue_persist_and_resume(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
