@@ -50,23 +50,27 @@ def _query_key_is_secret(name: str) -> bool:
     return any(fragment in folded for fragment in _URL_SECRET_KEY_FRAGMENTS)
 
 
-def redact_url_query(value: str) -> str:
+def redact_url_query(value: str, *, drop_fragment: bool = False) -> str:
     """Strip credential-looking query parameters from a URL.
 
     Long signed-URL parameters (S3, Azure, GCS, OAuth) routinely outlive the
     request that produced them.  Anything that survives in a persisted job
     record, a backup, or an API error message must not carry those values.
+    This is the single implementation of that policy: callers choose only
+    whether a ``#fragment`` may survive, because backup exports scrub
+    implicit-flow tokens carried in the fragment while job source URLs keep
+    theirs (``#t=60`` markers).
     """
     from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
     try:
         parts = urlsplit(str(value or ""))
-        if not parts.query:
-            return str(value or "")
-        query = [(name, item) for name, item in parse_qsl(parts.query, keep_blank_values=True) if not _query_key_is_secret(name)]
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
     except (TypeError, ValueError):
         return ""
+    if not parts.query and not (drop_fragment and parts.fragment):
+        return str(value or "")
+    query = [(name, item) for name, item in parse_qsl(parts.query, keep_blank_values=True) if not _query_key_is_secret(name)]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
 
 
 def _configured_secrets() -> Tuple[str, ...]:
@@ -471,6 +475,46 @@ def client_key(request: Request) -> str:
         if forwarded:
             return forwarded
     return remote or "local"
+
+
+# ---------------------------------------------------------------------------
+# Render (job) rate-limit budget
+#
+# One owner for the policy: which requests spend the render budget and how they
+# are keyed.  The HTTP middleware charges a request against its own path while
+# batch accounting deliberately spends the canonical per-render bucket, so a
+# batch of N consumes N single-job slots.  Keeping the classification and the
+# key construction together means a change lands in exactly one place.
+# ---------------------------------------------------------------------------
+
+MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+#: Canonical bucket for one render submission; batch and retry accounting spend
+#: the same slots a plain job create would.
+JOB_SUBMISSION_PATH = "/api/jobs"
+
+_JOB_BUDGET_PATHS = frozenset({"/api/jobs", "/api/jobs/batch", "/api/factory/jobs"})
+_JOB_BUDGET_PATH_PREFIX = "/api/jobs/"
+# Clip/thumbnail/waveform reads are drafts of an existing render, not new work.
+_JOB_BUDGET_EXCLUDED_PREFIXES = ("/api/jobs/clip/", "/api/jobs/thumbnail/", "/api/jobs/waveform/")
+
+
+def is_job_budget_request(method: str, path: str) -> bool:
+    """True when this request must be charged against the render budget.
+
+    Only mutations spend it.  The reads under these paths are the progress
+    poll, the SSE stream and the project list, so charging them here would
+    throttle ordinary browsing against the much smaller job limit.
+    """
+    if str(method).upper() not in MUTATING_METHODS:
+        return False
+    if path in _JOB_BUDGET_PATHS:
+        return True
+    return path.startswith(_JOB_BUDGET_PATH_PREFIX) and not path.startswith(_JOB_BUDGET_EXCLUDED_PREFIXES)
+
+
+def rate_limit_key(client: str, path: str) -> str:
+    """Build a limiter bucket key; the only place keys are constructed."""
+    return f"{client}:{path}"
 
 
 class LoginAttemptLimiter:

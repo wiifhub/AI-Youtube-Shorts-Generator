@@ -21,6 +21,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 
 from web.models import BatchRequest, JobRequest, ProjectUpdate
+from web.security import JOB_SUBMISSION_PATH, rate_limit_key
 
 
 router = APIRouter()
@@ -93,9 +94,8 @@ def create_batch_jobs(
     usable = [str(url).strip() for url in req.urls if len(str(url).strip()) >= 3]
     if not usable:
         raise HTTPException(400, "batch did not contain any usable URLs or file paths")
-    bucket = f"{studio.client_key(request)}:/api/jobs"
-    limiter = studio._job_rate_limiter
-    limit = studio._job_rate_limit_per_minute
+    limiter, limit = studio._job_budget()
+    bucket = rate_limit_key(studio.client_key(request), JOB_SUBMISSION_PATH)
     remaining = limiter.remaining(bucket, limit)
     if remaining < len(usable):
         raise HTTPException(

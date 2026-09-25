@@ -25,7 +25,7 @@ from urllib.parse import unquote, urlparse
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -68,6 +68,7 @@ from shorts_generator.costs import rates_from_environment  # noqa: E402
 from shorts_generator.export_profiles import validate_export_settings  # noqa: E402
 from web.models import JobRequest, ProviderCostRates  # noqa: E402
 from web.security import (  # noqa: E402
+    MUTATING_METHODS,
     SlidingWindowLimiter,
     auth_enabled,
     authorized,
@@ -75,8 +76,10 @@ from web.security import (  # noqa: E402
     client_key,
     error_response,
     host_is_loopback,
+    is_job_budget_request,
     is_safe_request_origin,
     make_rate_limiter,
+    rate_limit_key,
     rate_limit_response,
     redact_structure,
     redact_text,
@@ -276,21 +279,21 @@ _allow_external_paths = os.getenv("SHORTS_ALLOW_EXTERNAL_PATHS", "false").strip(
 _rate_limit_per_minute = _positive_int_env("SHORTS_RATE_LIMIT_PER_MINUTE", 600)
 _upload_rate_limit_per_minute = _positive_int_env("SHORTS_UPLOAD_RATE_LIMIT_PER_MINUTE", 10)
 _job_rate_limit_per_minute = _positive_int_env("SHORTS_JOB_RATE_LIMIT_PER_MINUTE", 30)
-_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-_job_rate_limit_paths = {
-    "/api/jobs",
-    "/api/jobs/batch",
-    "/api/factory/jobs",
-}
-# Retry re-runs a full render, so it must count against the same job budget.
-# Only mutations spend that budget: the reads under these paths are the
-# progress poll, the SSE stream and the project list, so charging them here
-# would throttle ordinary browsing against the much smaller job limit.
-_job_rate_limit_path_prefixes = ("/api/jobs/",)
-_job_rate_limit_excluded_path_prefixes = ("/api/jobs/clip/", "/api/jobs/thumbnail/", "/api/jobs/waveform/")
 _rate_limiter = make_rate_limiter(_rate_limit_per_minute, name="general")
 _upload_rate_limiter = make_rate_limiter(_upload_rate_limit_per_minute, name="upload")
 _job_rate_limiter = make_rate_limiter(_job_rate_limit_per_minute, name="job")
+
+
+def _job_budget() -> Tuple[Any, int]:
+    """Return the configured render-budget limiter and its per-minute limit.
+
+    Route modules use this access point instead of reaching for the limiter
+    globals individually, so the budget's configuration sits next to its
+    classification policy in :mod:`web.security`.
+    """
+    return _job_rate_limiter, _job_rate_limit_per_minute
+
+
 _job_executor: Optional[ThreadPoolExecutor] = None
 _job_futures: Dict[str, Future[Any]] = {}
 _max_queued_jobs = _positive_int_env("SHORTS_MAX_QUEUED_JOBS", 64)
@@ -486,7 +489,7 @@ async def security_middleware(request: Request, call_next: Any):
         return error_response("Authentication required", "auth_required", 401)
     if (
         auth_enabled()
-        and request.method.upper() in _MUTATING_METHODS
+        and request.method.upper() in MUTATING_METHODS
         and request.cookies.get("shorts_token")
         # Bearer-authenticated callers are not cookie-authenticated and stay
         # exempt from the browser-focused CSRF controls.
@@ -508,16 +511,9 @@ async def security_middleware(request: Request, call_next: Any):
         if path == "/api/uploads":
             limiter = _upload_rate_limiter
             limit = _upload_rate_limit_per_minute
-        elif request.method.upper() in _MUTATING_METHODS and (
-            path in _job_rate_limit_paths
-            or (
-                path.startswith(_job_rate_limit_path_prefixes)
-                and not path.startswith(_job_rate_limit_excluded_path_prefixes)
-            )
-        ):
-            limiter = _job_rate_limiter
-            limit = _job_rate_limit_per_minute
-        allowed, retry_after = limiter.allow(f"{client_key(request)}:{path}", limit)
+        elif is_job_budget_request(request.method, path):
+            limiter, limit = _job_budget()
+        allowed, retry_after = limiter.allow(rate_limit_key(client_key(request), path), limit)
         if not allowed:
             return rate_limit_response(retry_after)
     response = await call_next(request)

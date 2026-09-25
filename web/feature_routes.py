@@ -56,17 +56,6 @@ def _studio() -> Any:
     return importlib.import_module("web.app")
 
 
-# Backup/restore data must never carry credential-bearing query parameters.
-# Matching is a case-insensitive substring test so variants such as
-# ``AccessToken`` or ``client_secret`` are covered as well.
-_URL_SECRET_QUERY_KEYS = ("token", "secret", "signature", "sig", "credential", "auth", "key", "password", "session", "jwt", "expir")
-
-
-def _query_key_is_secret(name: str) -> bool:
-    folded = str(name).casefold()
-    return any(fragment in folded for fragment in _URL_SECRET_QUERY_KEYS)
-
-
 _BACKUP_URL_KEYS = {
     "raw_source_video_url",
     "source_video_url",
@@ -97,14 +86,11 @@ def _safe_backup_value(value: Any, key: str = "") -> Any:
     if isinstance(value, list):
         return [_safe_backup_value(item, key) for item in value]
     if isinstance(value, str) and (value.startswith("http://") or value.startswith("https://")):
-        try:
-            from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-
-            parts = urlsplit(value)
-            query = [(name, item) for name, item in parse_qsl(parts.query, keep_blank_values=True) if not _query_key_is_secret(name)]
-            return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
-        except (TypeError, ValueError):
-            return None
+        # Shared policy: the secret query-key list lives in ``web.security`` so
+        # a new provider parameter cannot be scrubbed on one path and leak on
+        # another.  Backup exports also clear the fragment, and a URL with no
+        # safe form at all is dropped from the archive.
+        return redact_url_query(value, drop_fragment=True) or None
     return value
 
 
