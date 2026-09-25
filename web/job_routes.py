@@ -105,6 +105,9 @@ def create_batch_jobs(
     jobs = []
     defaults = req.model_dump()
     defaults.pop("urls", None)
+    # One typed project name describes the single-source form, not a whole batch;
+    # every batch entry keeps its own derived name.
+    defaults.pop("name", None)
     for url in usable:
         # Authoritative per-URL accounting in the same bucket the middleware
         # uses for single job creation, so batches cannot multiply the quota.

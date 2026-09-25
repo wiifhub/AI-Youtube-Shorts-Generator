@@ -79,6 +79,9 @@ class ChapterHint(StrictModel):
 
 class JobRequest(StrictModel):
     url: str = Field(..., min_length=3, max_length=8192)
+    # The name the creator typed in the workspace.  Without it the project is
+    # named after the source, which for a local file is its whole path.
+    name: Optional[str] = Field(default=None, max_length=80)
     mode: Mode = "local"
     num_clips: int = Field(3, ge=1, le=12)
     aspect_ratio: AspectRatio = "9:16"

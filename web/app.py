@@ -1873,8 +1873,13 @@ def _enqueue_job(
     stored_url = redact_url_query(fetch_url) if "://" in fetch_url else fetch_url
     req.url = fetch_url
     job_id = uuid.uuid4().hex[:12]
-    default_name = re.sub(r"[^A-Za-z0-9 _-]+", " ", stored_url.rsplit("/", 1)[-1]).strip()
-    default_name = " ".join(default_name.split())[:80] or "Untitled project"
+    # The name the creator typed wins; the fallback is the source's leaf name
+    # without the upload prefix.  A local path is separated by backslashes, so
+    # splitting on "/" alone named every Windows project after its whole path.
+    requested_name = " ".join((req.name or "").split())
+    leaf = Path(re.sub(r"^upload_[0-9a-f]{12}_", "", re.split(r"[\\/]", stored_url)[-1])).stem
+    fallback_name = re.sub(r"[^A-Za-z0-9 _-]+", " ", leaf).strip()
+    default_name = requested_name[:80] or " ".join(fallback_name.split())[:80] or "Untitled project"
     with _lock:
         _jobs[job_id] = {
             "id": job_id,

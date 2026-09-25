@@ -1054,3 +1054,64 @@ def test_extended_length_path_forms_stay_inside_the_job_boundary(
         assert studio._job_output_dir(job) == output_dir.resolve()
         # Outside the boundary is still refused in either spelling.
         assert studio._job_media_path(job, prefix + str((tmp_path / "outside.mp4").resolve())) is None
+
+
+def test_project_name_comes_from_the_creator_and_falls_back_to_the_file_name(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The name field has to reach the record, and the fallback has to be a name.
+
+    A local source is a Windows path whose separators are backslashes, so
+    deriving the fallback from the last ``/`` segment named every uploaded
+    project after its whole path -- which the project grid then truncated.
+    """
+    monkeypatch.setattr(studio, "_output_root", tmp_path)
+    monkeypatch.setattr(studio, "_jobs_dir", tmp_path / "jobs")
+    monkeypatch.setattr(studio, "_allow_external_paths", False)
+    monkeypatch.setattr(studio, "_start_job_thread", lambda *args, **kwargs: None)
+    monkeypatch.setattr(studio, "_rate_limiter", studio.SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "_upload_rate_limiter", studio.SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "_job_rate_limiter", studio.SlidingWindowLimiter(limit=1000, window_seconds=60))
+    uploads = tmp_path / "uploads"
+    uploads.mkdir(parents=True)
+    source = uploads / "upload_0123456789ab_creator_talk.mp4"
+    source.write_bytes(b"stub")
+
+    typed = client.post("/api/jobs", json={"url": str(source), "mode": "local", "name": "Episode 12"})
+    assert typed.status_code == 200, typed.text
+    assert typed.json()["name"] == "Episode 12"
+
+    derived = client.post("/api/jobs", json={"url": str(source), "mode": "local"})
+    assert derived.status_code == 200, derived.text
+    assert derived.json()["name"] == "creator_talk"
+
+
+def test_a_batch_keeps_one_name_per_source(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A typed name describes the single-source form, not every batch entry.
+
+    The workspace sends whatever is in the name box with the batch payload, so
+    without this every project in a batch carried one shared name and the
+    library could not tell them apart.
+    """
+    monkeypatch.setattr(studio, "_output_root", tmp_path)
+    monkeypatch.setattr(studio, "_jobs_dir", tmp_path / "jobs")
+    monkeypatch.setattr(studio, "_allow_external_paths", False)
+    monkeypatch.setattr(studio, "_start_job_thread", lambda *args, **kwargs: None)
+    monkeypatch.setattr(studio, "_rate_limiter", studio.SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "_upload_rate_limiter", studio.SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "_job_rate_limiter", studio.SlidingWindowLimiter(limit=1000, window_seconds=60))
+    uploads = tmp_path / "uploads"
+    uploads.mkdir(parents=True)
+    first = uploads / "upload_0123456789ab_first_talk.mp4"
+    second = uploads / "upload_0123456789cd_second_talk.mp4"
+    first.write_bytes(b"stub")
+    second.write_bytes(b"stub")
+
+    response = client.post(
+        "/api/jobs/batch",
+        json={"urls": [str(first), str(second)], "mode": "local", "name": "Weekly roundup"},
+    )
+    assert response.status_code == 200, response.text
+    assert sorted(job["name"] for job in response.json()["jobs"]) == ["first_talk", "second_talk"]

@@ -41,7 +41,7 @@
       </section>
 
       <section id="workspaceView" class="view" aria-labelledby="workspaceTitle">
-        <div class="workspace-title"><div><div class="eyebrow">Editing workspace</div><input class="project-name" id="projectName" value="Untitled project" aria-label="Project name" /></div><span class="badge" id="jobBadge">New project</span><span class="badge" id="jobIdBadge" hidden></span></div>
+        <div class="workspace-title"><div><div class="eyebrow">Editing workspace</div><input class="project-name" id="projectName" placeholder="Untitled project" maxlength="80" aria-label="Project name" /></div><span class="badge" id="jobBadge">New project</span><span class="badge" id="jobIdBadge" hidden></span></div>
         <div class="workspace-grid">
           <section class="panel source-panel"><div class="panel-head"><div><h2>Source</h2><p>Video, ranking, and render setup</p></div><span class="badge" id="sourceBadge" role="status" aria-live="polite">Ready</span></div><div class="source-body">
             <div class="dropzone" id="dropzone" tabindex="0"><div class="dropzone-copy">Drop a video here</div><div class="dropzone-sub">MP4, MOV, MKV, WEBM, or paste a YouTube URL</div><input class="input" id="sourceInput" name="url" placeholder="https://youtube.com/watch?..." aria-label="Video URL or local path"><input id="fileInput" type="file" accept="video/*,.mkv,.webm" hidden><div class="source-actions"><button class="secondary" id="chooseFile" type="button">Choose video</button><button class="ghost" id="clearSource" type="button">Clear</button></div><div class="dropzone-sub" id="uploadStatus" role="status"></div></div>

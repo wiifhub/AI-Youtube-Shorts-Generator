@@ -11,6 +11,7 @@
       const mode = value('mode');
       const local = mode === 'local';
       return {
+        name: value('projectName').trim() || null,
         url: value('sourceInput').trim(), mode,
         num_clips: Math.min(12, Math.max(1, Math.round(number('numClips', 3)))),
         aspect_ratio: value('aspect'), download_format: value('format'),
