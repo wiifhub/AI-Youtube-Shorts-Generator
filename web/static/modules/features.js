@@ -57,8 +57,7 @@
         try {
           const response = await fetch('/api/v1/youtube/oauth/start'); const data = await response.json();
           if (!response.ok) throw Error(data.error || data.detail || 'YouTube OAuth is not configured');
-          const opened = window.open(data.authorization_url, '_blank', 'noopener,noreferrer');
-          if (!opened) window.location.href = data.authorization_url;
+          window.ShortsStudioUI.safeOpen(data.authorization_url, setStatus);
           setStatus('Authorize Shorts Studio in the Google consent window, then return here. This page will refresh the connection status.');
           let checks = 0; const timer = window.setInterval(async () => { checks += 1; const current = await refreshYouTubeStatus(); if (current?.authorized || checks >= 30) window.clearInterval(timer); }, 2000);
         } catch (error) { setStatus(error.message); }

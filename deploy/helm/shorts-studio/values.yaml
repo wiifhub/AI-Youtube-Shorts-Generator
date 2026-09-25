@@ -51,8 +51,14 @@ env:
   SHORTS_STUDIO_BROWSER: "true"
   SHORTS_RATE_LIMIT_BACKEND: "sqlite"
   SHORTS_RATE_LIMIT_STORE: "/data/rate_limits.sqlite3"
+  # The app runs as a cluster service and must fail closed: the startup guard
+  # refuses to serve when SHORTS_API_TOKEN is missing.
+  SHORTS_BIND_HOST: "0.0.0.0"
 
-secretEnv: {}
+# Required. At minimum provide SHORTS_API_TOKEN here, e.g.
+#   helm install ... --set-string secretEnv.SHORTS_API_TOKEN=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
+secretEnv:
+  SHORTS_API_TOKEN: ""
 
 nodeSelector: {}
 tolerations: []

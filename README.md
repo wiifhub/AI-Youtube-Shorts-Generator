@@ -109,7 +109,7 @@ docker compose --env-file .env.docker --profile gpu up --build shorts-studio-gpu
 
 The GPU workspace is available at <http://127.0.0.1:7861> and uses `LOCAL_WHISPER_DEVICE=cuda` by default. Set `LOCAL_WHISPER_MODEL` in `.env.docker` to choose a different model. CPU mode remains the fallback when no GPU is available.
 
-The Compose file binds to loopback for safety. For a shared or remote deployment, set `SHORTS_API_TOKEN` to enable the built-in bearer/session-cookie authentication, and still use TLS or a reverse proxy. Do not expose the service without both authentication and transport protection. API keys are passed at runtime and are never copied into the image.
+The Compose file binds to loopback for safety and now **requires** `SHORTS_API_TOKEN` in `.env.docker` — the application refuses to start when bound to a non-loopback address without a token (override only with the explicit `SHORTS_ALLOW_UNAUTHENTICATED_REMOTE=true` escape hatch). The token enables the built-in bearer/session-cookie authentication; still use TLS or a reverse proxy for transport protection. API keys are passed at runtime and are never copied into the image.
 
 The Docker image intentionally omits `pywebview` and `pystray`: the browser is the container's desktop surface. The regular Windows package still provides the browser-free native window.
 
@@ -242,7 +242,10 @@ Copy `.env.example` to `.env` and edit only the settings you need. Never commit 
 | `SHORTS_ALLOW_EXTERNAL_PATHS` | Explicitly allow local media/save paths outside the output root | `false` |
 | `SHORTS_MAX_UPLOAD_MB` | Maximum uploaded source size | `2048` |
 | `SHORTS_MAX_JSON_MB` | Maximum JSON request body accepted by the API | `2` |
-| `SHORTS_API_TOKEN` | Optional token required for every API route except health/auth status/login | empty (disabled) |
+| `SHORTS_API_TOKEN` | Token required for every API route except health/auth status/login; **mandatory for non-loopback binds** | empty (disabled) |
+| `SHORTS_BIND_HOST` | Bind host the fail-closed startup guard inspects | `127.0.0.1` |
+| `SHORTS_COOKIE_SECURE` | Force the `Secure` attribute on session cookies (`auto` by default: the request is https, or a proxy sent `X-Forwarded-Proto: https`) | empty |
+| `SHORTS_MAX_QUEUED_JOBS` | Combined running+queued render budget before new jobs are rejected with 429 | `64` |
 | `SHORTS_RATE_LIMIT_PER_MINUTE` | General per-client API request limit | `600` |
 | `SHORTS_UPLOAD_RATE_LIMIT_PER_MINUTE` | Per-client upload limit | `10` |
 | `SHORTS_JOB_RATE_LIMIT_PER_MINUTE` | Per-client job submission limit | `30` |
@@ -337,7 +340,7 @@ The loopback FastAPI service powers the desktop shell and can be used by local t
 | `POST /api/update/apply` | Download and apply a packaged update |
 | `POST /api/shutdown` | Stop the local server |
 
-All routes bind to `127.0.0.1` by default. When `SHORTS_API_TOKEN` is set, every API route other than health/auth status/login requires the token as `Authorization: Bearer ...`, `X-Shorts-Token`, or the HttpOnly cookie returned by login. Keep TLS and an upstream reverse proxy for internet-facing use; choose the SQLite limiter for same-host multi-worker deployments and a gateway limiter for multi-host deployments.
+All routes bind to `127.0.0.1` by default. When `SHORTS_API_TOKEN` is set, every API route other than health/auth status/login requires the token as `Authorization: Bearer ...` or `X-Shorts-Token`. Login exchanges the token for an HttpOnly session cookie whose value is unrelated to the token (rotating the token revokes issued sessions), and cookie-authenticated mutations must pass same-origin plus `X-CSRF-Token` double-submit checks (the bundled UI does this automatically). Startup fails closed when binding a non-loopback `SHORTS_BIND_HOST` without a token. Keep TLS and an upstream reverse proxy for internet-facing use; choose the SQLite limiter for same-host multi-worker deployments and a gateway limiter for multi-host deployments.
 
 Every path above also exists under `/api/v1/`. Versioned errors use the
 stable `{error, code}` contract documented by `/api/v1/errors`. Legacy calls

@@ -15,15 +15,19 @@ use API mode there, or run local mode on amd64 until upstream publishes the
 needed wheel. The application returns the normal missing-local-dependency
 message instead of silently falling back.
 
-The audit used Python 3.12 / CP312 and the `manylinux_2_17_aarch64` target:
+The audit used Python 3.12 / CP312 against the manylinux glibc tiers the
+Debian 12 (bookworm, glibc 2.36) runtime image supports. Pillow 12.3.0 ships
+aarch64 wheels as `manylinux_2_27`/`2_28` while OpenCV ships `manylinux_2_17`,
+so the CI job passes all compatible tiers explicitly:
 
 ```text
 python -m pip download --only-binary=:all: \
-  --platform manylinux_2_17_aarch64 --implementation cp \
+  --platform manylinux_2_17_aarch64 --platform manylinux_2_27_aarch64 \
+  --platform manylinux_2_28_aarch64 --implementation cp \
   --python-version 312 --abi cp312 -r requirements-docker-arm64.txt
 ```
 
-The command resolved 43 wheels, including OpenCV 4.13.0.92, Pillow 12.2.0,
+The command resolves 43 wheels, including OpenCV 4.13.0.92, Pillow 12.3.0,
 NumPy, FastAPI, Uvicorn, OpenAI, Google GenAI, and their transitive packages.
 The Docker workflow performs the actual multi-architecture build and push;
 Docker Buildx is not required on a developer workstation.

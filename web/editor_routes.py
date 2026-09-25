@@ -1087,7 +1087,7 @@ def preview_clip(job_id: str, update: ClipUpdate) -> Dict[str, Any]:
     if cached.is_file():
         shutil.copyfile(cached, preview)
         return {
-            "preview_url": f"/api/jobs/{job_id}/preview.mp4?key={preview_key}",
+            "preview_url": f"/api/jobs/{job_id}/preview.mp4",
             "path": str(preview),
             "cached": True,
         }
@@ -1145,7 +1145,7 @@ def preview_clip(job_id: str, update: ClipUpdate) -> Dict[str, Any]:
                 render_path.unlink()
             except OSError:
                 pass
-    return {"preview_url": f"/api/jobs/{job_id}/preview.mp4?key={preview_key}", "path": str(preview), "cached": False}
+    return {"preview_url": f"/api/jobs/{job_id}/preview.mp4", "path": str(preview), "cached": False}
 
 
 @router.get("/api/jobs/{job_id}/preview.mp4")

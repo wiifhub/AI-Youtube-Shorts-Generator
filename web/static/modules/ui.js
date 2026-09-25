@@ -132,9 +132,27 @@
     if (dom('crumbTitle') && title) dom('crumbTitle').textContent = title.textContent;
   }
 
+  /* Open a server-provided URL only when it is an absolute https (or
+     same-origin http on loopback) link. Guards release links, OAuth consent
+     URLs, and upload pages against javascript:/data:/intranet pivots. */
+  const safeOpen = (url, fallbackStatus) => {
+    const value = String(url || '').trim();
+    let parsed = null;
+    try { parsed = new URL(value, window.location.href); } catch (_) { parsed = null; }
+    const origin = window.location.origin;
+    const isHttp = parsed && (parsed.protocol === 'https:' || (parsed.protocol === 'http:' && parsed.origin === origin));
+    if (!parsed || !isHttp || /[\r\n\t]/.test(value) || parsed.username || parsed.password) {
+      if (fallbackStatus) fallbackStatus('The application returned an unsafe link; it was not opened.');
+      return false;
+    }
+    const opened = window.open(parsed.href, '_blank', 'noopener,noreferrer');
+    if (!opened && fallbackStatus) fallbackStatus(`Open this page manually: ${parsed.href}`);
+    return Boolean(opened);
+  };
+
   window.ShortsStudioUI = {
     $: dom, dom, escapeHtml, esc: escapeHtml, finiteNumber, fmtTime, fmtDate,
     toast, showSkeletons, clearBusy, progressPercent, renderProgress, announce,
-    setView, dismissNotification
+    setView, dismissNotification, safeOpen
   };
 })();

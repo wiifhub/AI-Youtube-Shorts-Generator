@@ -202,6 +202,15 @@ def _pkce_challenge(verifier: str) -> str:
     return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
 
+def _validate_returned_url(url: str, label: str) -> str:
+    """Validate a provider-supplied URL before the browser is pointed at it."""
+    from web.security import is_safe_open_url
+
+    if not is_safe_open_url(url):
+        raise ValueError(f"{label} returned an unsafe URL; refusing to open it")
+    return str(url).strip()
+
+
 def start_youtube_oauth(*, redirect_uri: Optional[str] = None) -> Dict[str, Any]:
     config = youtube_oauth_config()
     if not config.configured:
@@ -231,7 +240,7 @@ def start_youtube_oauth(*, redirect_uri: Optional[str] = None) -> Dict[str, Any]
             "code_challenge_method": "S256",
         }
     )
-    return {"authorization_url": f"{_AUTH_ENDPOINT}?{query}", "state": state, "expires_in": int(_OAUTH_STATE_TTL)}
+    return {"authorization_url": _validate_returned_url(f"{_AUTH_ENDPOINT}?{query}", "YouTube OAuth"), "state": state, "expires_in": int(_OAUTH_STATE_TTL)}
 
 
 def complete_youtube_oauth(code: str, state: str) -> Dict[str, Any]:
@@ -764,7 +773,7 @@ def start_tiktok_oauth() -> Dict[str, Any]:
             "state": state,
         }
     )
-    return {"authorization_url": f"https://www.tiktok.com/v2/auth/authorize/?{query}", "state": state, "expires_in": int(_SOCIAL_OAUTH_TTL)}
+    return {"authorization_url": _validate_returned_url(f"https://www.tiktok.com/v2/auth/authorize/?{query}", "TikTok OAuth"), "state": state, "expires_in": int(_SOCIAL_OAUTH_TTL)}
 
 
 def complete_tiktok_oauth(code: str, state: str) -> Dict[str, Any]:
@@ -816,7 +825,7 @@ def start_instagram_oauth() -> Dict[str, Any]:
             "state": state,
         }
     )
-    return {"authorization_url": f"https://www.facebook.com/{config['graph_version']}/dialog/oauth?{query}", "state": state, "expires_in": int(_SOCIAL_OAUTH_TTL)}
+    return {"authorization_url": _validate_returned_url(f"https://www.facebook.com/{config['graph_version']}/dialog/oauth?{query}", "Instagram OAuth"), "state": state, "expires_in": int(_SOCIAL_OAUTH_TTL)}
 
 
 def complete_instagram_oauth(code: str, state: str) -> Dict[str, Any]:
@@ -826,10 +835,13 @@ def complete_instagram_oauth(code: str, state: str) -> Dict[str, Any]:
     if not config["app_id"] or not app_secret:
         raise ValueError("Instagram OAuth is not configured")
     _social_oauth_state(state, "instagram")
+    # The token exchange must be a POST: sending client_secret as a GET query
+    # parameter leaks it into provider error messages, access logs, and any
+    # URL echo in exceptions.
     response = _social_request_with_retry(
-        "GET",
+        "POST",
         f"https://graph.facebook.com/{config['graph_version']}/oauth/access_token",
-        params={
+        data={
             "client_id": config["app_id"],
             "client_secret": app_secret,
             "redirect_uri": redirect_uri,
@@ -977,10 +989,12 @@ def publish_instagram_reel(
     token = _instagram_access_token()
     config = instagram_oauth_config()
     base = f"https://graph.facebook.com/{config['graph_version']}"
+    # Credentials travel in the POST form body; putting the access token in a
+    # URL query string leaks it into provider error messages and request logs.
     container_response = _social_request_with_retry(
         "POST",
         f"{base}/{config['user_id']}/media",
-        params={"media_type": "REELS", "video_url": url, "caption": str(caption or "")[:2200], "access_token": token},
+        data={"media_type": "REELS", "video_url": url, "caption": str(caption or "")[:2200], "access_token": token},
         timeout=(15, 30),
     )
     container_response.raise_for_status()
@@ -1010,7 +1024,7 @@ def publish_instagram_reel(
     publish_response = _social_request_with_retry(
         "POST",
         f"{base}/{config['user_id']}/media_publish",
-        params={"creation_id": container_id, "access_token": token},
+        data={"creation_id": container_id, "access_token": token},
         timeout=(15, 30),
     )
     publish_response.raise_for_status()

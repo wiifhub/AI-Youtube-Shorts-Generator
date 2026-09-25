@@ -25,7 +25,7 @@ from fastapi.responses import StreamingResponse
 
 from web.models import BrandPreset, CleanupRequest, FactoryApprovalRequest, ProviderCostRates, PublishRequest, TranscriptUpdate
 from web.factory import approved_for_clip, factory_manifest
-from web.security import redact_structure
+from web.security import redact_structure, redact_text, redact_url_query
 from web.migrations import CURRENT_SCHEMA_VERSION, PROJECT_FORMAT_VERSION, migrate_job_record
 from web.publishing import (
     PLATFORMS,
@@ -56,7 +56,17 @@ def _studio() -> Any:
     return importlib.import_module("web.app")
 
 
-_URL_SECRET_QUERY_KEYS = {"token", "access_token", "signature", "sig", "expires", "expiry", "auth"}
+# Backup/restore data must never carry credential-bearing query parameters.
+# Matching is a case-insensitive substring test so variants such as
+# ``AccessToken`` or ``client_secret`` are covered as well.
+_URL_SECRET_QUERY_KEYS = ("token", "secret", "signature", "sig", "credential", "auth", "key", "password", "session", "jwt", "expir")
+
+
+def _query_key_is_secret(name: str) -> bool:
+    folded = str(name).casefold()
+    return any(fragment in folded for fragment in _URL_SECRET_QUERY_KEYS)
+
+
 _BACKUP_URL_KEYS = {
     "raw_source_video_url",
     "source_video_url",
@@ -91,7 +101,7 @@ def _safe_backup_value(value: Any, key: str = "") -> Any:
             from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
             parts = urlsplit(value)
-            query = [(name, item) for name, item in parse_qsl(parts.query, keep_blank_values=True) if name.lower() not in _URL_SECRET_QUERY_KEYS]
+            query = [(name, item) for name, item in parse_qsl(parts.query, keep_blank_values=True) if not _query_key_is_secret(name)]
             return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
         except (TypeError, ValueError):
             return None
@@ -860,9 +870,16 @@ def _publish_audit_entry(
 
 
 def _publish_error(exc: Exception) -> HTTPException:
+    """Convert a publishing exception into a credential-free HTTP error.
+
+    Provider SDK exceptions routinely embed the full request URL, and for
+    Instagram/Graph that URL carries ``access_token``/``client_secret`` query
+    parameters.  The message is redacted before it ever reaches the client or
+    the audit log.
+    """
     if isinstance(exc, YouTubePublishError):
-        return HTTPException(exc.status_code, {"error": str(exc), "code": exc.code})
-    return HTTPException(502, {"error": str(exc), "code": "publish_failed"})
+        return HTTPException(exc.status_code, {"error": redact_text(str(exc)), "code": exc.code})
+    return HTTPException(502, {"error": redact_text(str(exc)), "code": "publish_failed"})
 
 
 @router.post("/jobs/{job_id}/publish", tags=["projects"])
@@ -1037,7 +1054,7 @@ def tiktok_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
     try:
         return {"status": "authorized", **complete_tiktok_oauth(code, state)}
     except (ValueError, RuntimeError, requests.RequestException) as exc:
-        raise HTTPException(400, {"error": str(exc), "code": "oauth_invalid"}) from exc
+        raise HTTPException(400, {"error": redact_text(str(exc)), "code": "oauth_invalid"}) from exc
 
 
 @router.get("/instagram/oauth/status", tags=["projects"])
@@ -1060,7 +1077,7 @@ def instagram_oauth_callback(code: Optional[str] = None, state: Optional[str] = 
     try:
         return {"status": "authorized", **complete_instagram_oauth(code, state)}
     except (ValueError, RuntimeError, requests.RequestException) as exc:
-        raise HTTPException(400, {"error": str(exc), "code": "oauth_invalid"}) from exc
+        raise HTTPException(400, {"error": redact_text(str(exc)), "code": "oauth_invalid"}) from exc
 
 
 @router.get("/youtube/oauth/start", tags=["projects"])
@@ -1081,7 +1098,7 @@ def youtube_oauth_callback(code: Optional[str] = None, state: Optional[str] = No
     try:
         return {"status": "authorized", **complete_youtube_oauth(code, state)}
     except (ValueError, RuntimeError, requests.RequestException) as exc:
-        raise HTTPException(400, {"error": str(exc), "code": "oauth_invalid"}) from exc
+        raise HTTPException(400, {"error": redact_text(str(exc)), "code": "oauth_invalid"}) from exc
 
 
 @router.post("/jobs/{job_id}/youtube/publish", tags=["projects"])

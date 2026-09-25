@@ -7,12 +7,14 @@ import hmac
 import ipaddress
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Deque, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -26,7 +28,45 @@ def error_response(message: str, code: str, status_code: int, **extra: Any) -> J
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\b(?:sk-[A-Za-z0-9_-]{8,}|sk-ant-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{8,}|mu_[A-Za-z0-9_-]{8,}|co_[A-Za-z0-9_-]{8,}|hf_[A-Za-z0-9_-]{8,})\b"),
     re.compile(r"(?i)\b(?:bearer|token|api[_ -]?key|secret)[=: ]+[A-Za-z0-9._~+/=-]{8,}"),
+    # URL query parameters are a common leak path for provider errors and
+    # echoed URLs: ``...?access_token=...&client_secret=...`` must never be
+    # returned to a client or written to a log.  The key part is matched
+    # loosely so underscored names (access_token, client_secret,
+    # X-Amz-Signature) are covered, not just bare ``token=``.
+    re.compile(r"(?i)(?:[?&])[\w.\-]*(?:token|secret|sig(?:nature)?|auth|credential|pass(?:word)?|api[_\-]?key|session)[\w.\-]*=[^&\s'\"<>]+"),
+    # AWS SigV4-style parameters on their own.
+    re.compile(r"(?i)(?:[?&])X-Amz-(?:Signature|Credential|Security-Token|SignedHeaders)=[^&\s'\"<>]+"),
 )
+
+# Query-parameter name fragments that mark a value as a credential. Matching is
+# case-insensitive and by substring so variants (token, AccessToken,
+# client_secret, X-Amz-Signature) are all caught when scrubbing URLs before
+# they are persisted or returned.
+_URL_SECRET_KEY_FRAGMENTS = ("token", "secret", "signature", "sig", "credential", "auth", "key", "password", "session", "jwt", "expir")
+
+
+def _query_key_is_secret(name: str) -> bool:
+    folded = str(name).casefold()
+    return any(fragment in folded for fragment in _URL_SECRET_KEY_FRAGMENTS)
+
+
+def redact_url_query(value: str) -> str:
+    """Strip credential-looking query parameters from a URL.
+
+    Long signed-URL parameters (S3, Azure, GCS, OAuth) routinely outlive the
+    request that produced them.  Anything that survives in a persisted job
+    record, a backup, or an API error message must not carry those values.
+    """
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(str(value or ""))
+        if not parts.query:
+            return str(value or "")
+        query = [(name, item) for name, item in parse_qsl(parts.query, keep_blank_values=True) if not _query_key_is_secret(name)]
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
+    except (TypeError, ValueError):
+        return ""
 
 
 def _configured_secrets() -> Tuple[str, ...]:
@@ -42,6 +82,8 @@ def _configured_secrets() -> Tuple[str, ...]:
 def redact_text(value: Any, secrets: Optional[Dict[str, str]] = None, max_length: int = 4000) -> str:
     """Redact known provider formats and explicitly supplied session secrets."""
     text = str(value or "")
+    if "://" in text:
+        text = redact_url_query(text)
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub("[redacted]", text)
     explicit = tuple(value for value in (secrets or {}).values() if isinstance(value, str))
@@ -70,7 +112,154 @@ def auth_enabled() -> bool:
     return bool(configured_token())
 
 
+# ---------------------------------------------------------------------------
+# Session cookie: the configured API token is a high-entropy credential and is
+# accepted as a bearer header, but it is never stored in the browser.  The
+# login route exchanges it for a random stateless session value whose digest
+# is bound to the active SHORTS_API_TOKEN, so a cookie copied from browser
+# storage cannot be replayed as the bearer token and a rotated
+# SHORTS_API_TOKEN invalidates every issued session immediately.
+# ---------------------------------------------------------------------------
+
+_SESSION_SERVER_KEY_SALT = b"shorts-studio-session-v1"
+_SESSION_COOKIE_TTL_SECONDS = 86400
+
+
+def _session_binding(configured: str, csrf_value: str, cookie_value: str) -> str:
+    """Digest tying a (CSRF, session-cookie) pair to the configured token."""
+    material = _SESSION_SERVER_KEY_SALT + configured.encode("utf-8") + csrf_value.encode("utf-8") + b":" + cookie_value.encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def issue_session_token() -> Tuple[str, str, int]:
+    """Return ``(cookie_value, csrf_token, max_age)`` for a fresh session.
+
+    The CSRF cookie carries ``<csrf_value>:<binding>`` where the binding is a
+    digest of the CSRF value together with the session cookie value and the
+    token configured at login time.  The middleware double-submit check
+    compares the ``X-CSRF-Token`` header against this cookie, and
+    :func:`verify_session_token` re-derives the same binding from the two
+    presented cookies, so a pair from a different token era is rejected and
+    neither cookie alone authenticates anything.
+    """
+    configured = configured_token()
+    cookie_value = secrets.token_urlsafe(32)
+    csrf_value = secrets.token_urlsafe(24)
+    binding = _session_binding(configured, csrf_value, cookie_value)
+    return cookie_value, f"{csrf_value}:{binding}", _SESSION_COOKIE_TTL_SECONDS
+
+
+def verify_session_token(cookie_value: str, csrf_token: Optional[str] = None) -> bool:
+    """Validate a session cookie against the currently configured token.
+
+    The digest is computed with the active ``SHORTS_API_TOKEN`` so rotating or
+    clearing that variable revokes every previously issued session at once.
+    When a CSRF token is supplied it must match the binding recorded at login
+    (double-submit cookie pattern, constant-time comparison).
+    """
+    configured = configured_token()
+    if not configured or not cookie_value or not cookie_value.strip():
+        return False
+    if csrf_token is None:
+        return False
+    csrf_value, separator, binding = str(csrf_token).partition(":")
+    if separator != ":" or not csrf_value or not binding:
+        return False
+    expected = _session_binding(configured, csrf_value, cookie_value)
+    return hmac.compare_digest(binding, expected)
+
+
+def session_cookie_secure(request: Optional[Request] = None) -> bool:
+    """Decide the ``Secure`` cookie attribute for a new session.
+
+    Order of authority:
+    1. ``SHORTS_COOKIE_SECURE`` explicit override.
+    2. The request is https, or a fronting proxy reports https through
+       ``X-Forwarded-Proto``.
+    3. Otherwise no ``Secure`` attribute.
+
+    The attribute follows the scheme the browser actually used, never the bind
+    host.  A container published over plain http on a LAN address (the default
+    ``docker-compose`` shape) is a legitimate deployment, and a ``Secure``
+    cookie makes browsers silently discard it: the login call returns 200 and
+    every later request stays unauthenticated.  Deployments that terminate TLS
+    in front of the app report https through ``X-Forwarded-Proto`` and keep a
+    Secure cookie; honouring that header can only add the attribute, never
+    remove it, so it needs no trusted-proxy gate.
+    """
+    override = os.getenv("SHORTS_COOKIE_SECURE", "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    if override in {"0", "false", "no", "off"}:
+        return False
+    if request is None:
+        return False
+    if request.url.scheme == "https":
+        return True
+    forwarded = str(request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    return forwarded == "https"
+
+
+def host_is_loopback(host: str) -> bool:
+    """Return True only for unambiguous loopback bind addresses."""
+    cleaned = str(host or "").strip().strip("[]")
+    if not cleaned:
+        return False
+    try:
+        return ipaddress.ip_address(cleaned).is_loopback
+    except ValueError:
+        return False
+
+
+def is_safe_open_url(url: str, *, allowed_schemes: Tuple[str, ...] = ("https",)) -> bool:
+    """Validate a server-provided URL before a browser is asked to open it.
+
+    Release notes and OAuth authorization URLs originate from upstream
+    responses.  Before handing one to ``window.open`` or a redirect, confirm
+    it is an absolute http(s) URL without embedded newlines or credential
+    components, so a compromised or hostile upstream cannot pivot the
+    browser onto ``file:``, ``javascript:``, or intranet schemes.
+    """
+    value = str(url or "").strip()
+    if not value or any(character in value for character in "\r\n\t") or "\\" in value:
+        return False
+    if any(character in value for character in "\x00\x1f") or any(ord(character) < 32 for character in value):
+        return False
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in allowed_schemes or not parsed.netloc:
+        return False
+    if "@" in parsed.netloc:
+        return False
+    return True
+
+
+def is_safe_request_origin(request: Request) -> bool:
+    """Decide whether a mutation may proceed when session-cookie authenticated.
+
+    SameSite=Strict already blocks cookies on most cross-site posts; this
+    second check covers proxies and older browsers.  A missing or ``null``
+    Origin with a cookie present is refused because such requests cannot be
+    distinguished from a sandboxed cross-site attack.
+    """
+    origin = request.headers.get("origin") or request.headers.get("referer")
+    if not origin:
+        return False
+    if str(origin).strip().casefold() in {"null", "\"null\""}:
+        return False
+    parsed = urlparse(origin)
+    return bool(parsed.netloc) and parsed.netloc == request.url.netloc
+
+
 def _candidate_tokens(request: Request) -> Tuple[str, ...]:
+    """Collect credential candidates for bearer authentication.
+
+    Only header-based credentials are accepted here.  The session cookie is
+    validated separately by :func:`session_cookie_valid` so the raw configured
+    token never has to live in browser storage.
+    """
     authorization = request.headers.get("authorization", "")
     bearer = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
     return tuple(
@@ -78,24 +267,51 @@ def _candidate_tokens(request: Request) -> Tuple[str, ...]:
         for token in (
             bearer,
             request.headers.get("x-shorts-token", "").strip(),
-            request.cookies.get("shorts_token", "").strip(),
         )
         if token
     )
 
 
-def authorized(request: Request) -> bool:
-    # API tokens are compared using a constant-time SHA-256 digest; the token
-    # itself is never persisted, which is the appropriate boundary for a
-    # high-entropy bearer credential rather than a password.
+def session_cookie_valid(request: Request) -> bool:
+    """True when the request carries a live session cookie (CSRF-aware)."""
+    return verify_session_token(
+        request.cookies.get("shorts_token", ""),
+        request.cookies.get("shorts_csrf"),
+    )
+
+
+def bearer_authorized(request: Request) -> bool:
+    """True when a header credential matches the configured token.
+
+    A malformed credential fails closed: when auth is configured but the
+    request carries no header credential at all, this returns False so the
+    caller can fall back to session-cookie validation rather than granting
+    bearer privileges to credential-less requests.
+    """
     expected = configured_token()
     if not expected:
         return True
+    candidates = _candidate_tokens(request)
+    if not candidates:
+        return False
     expected_digest = hashlib.sha256(expected.encode("utf-8")).digest()
     return any(
         hmac.compare_digest(hashlib.sha256(candidate.encode("utf-8")).digest(), expected_digest)
-        for candidate in _candidate_tokens(request)
+        for candidate in candidates
     )
+
+
+def authorized(request: Request) -> bool:
+    # Header credentials are compared using a constant-time SHA-256 digest; the
+    # token itself is never persisted, which is the appropriate boundary for a
+    # high-entropy bearer credential rather than a password.  Session cookies
+    # are validated through their own digest chain and additionally require a
+    # safe same-origin context for mutations (checked in the middleware).
+    if not configured_token():
+        return True
+    if bearer_authorized(request):
+        return True
+    return session_cookie_valid(request)
 
 
 class SlidingWindowLimiter:
@@ -127,6 +343,19 @@ class SlidingWindowLimiter:
                 for name in stale:
                     self._hits.pop(name, None)
             return True, 0
+
+    def remaining(self, key: str, limit: Optional[int] = None) -> int:
+        """Hits the caller may still make in the current window (read-only)."""
+        now = time.monotonic()
+        maximum = max(1, int(limit or self.limit))
+        with self._lock:
+            bucket = self._hits.get(key)
+            if not bucket:
+                return maximum
+            cutoff = now - self.window_seconds
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
+            return max(0, maximum - len(bucket))
 
 
 class SQLiteRateLimiter:
@@ -185,6 +414,24 @@ class SQLiteRateLimiter:
         except (OSError, sqlite3.Error):
             # A broken shared store must not silently disable abuse protection.
             return False, 1
+
+    def remaining(self, key: str, limit: Optional[int] = None) -> int:
+        """Hits the caller may still make in the current window (read-only)."""
+        maximum = max(1, int(limit or self.limit))
+        now = time.time()
+        cutoff = now - self.window_seconds
+        try:
+            with self._lock:
+                with self._connect() as connection:
+                    row = connection.execute(
+                        "SELECT COUNT(*) FROM rate_limit_hits WHERE key = ? AND hit_at > ?",
+                        (str(key), cutoff),
+                    ).fetchone()
+                    count = int(row[0] or 0) if row else 0
+                    return max(0, maximum - count)
+        except (OSError, sqlite3.Error):
+            # Fail closed: a broken shared store must not expand the budget.
+            return 0
 
 
 def make_rate_limiter(limit: int, *, name: str = "general") -> SlidingWindowLimiter | SQLiteRateLimiter:

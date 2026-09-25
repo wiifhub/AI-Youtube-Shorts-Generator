@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 import logging
 import math
 import os
@@ -70,12 +71,16 @@ from web.security import (  # noqa: E402
     SlidingWindowLimiter,
     auth_enabled,
     authorized,
+    bearer_authorized,
     client_key,
     error_response,
+    host_is_loopback,
+    is_safe_request_origin,
     make_rate_limiter,
     rate_limit_response,
     redact_structure,
     redact_text,
+    redact_url_query,
 )
 from web.feature_routes import router as feature_router  # noqa: E402
 from web.editor_routes import router as editor_router  # noqa: E402
@@ -94,6 +99,7 @@ async def lifespan(_app: FastAPI):
     _shutdown_requested.clear()
     _job_store.reopen()
     _ensure_job_executor()
+    _validate_remote_security_configuration()
     try:
         if _auto_resume:
             # Recovery is a bounded metadata pass; enqueue recovered work before
@@ -270,11 +276,28 @@ _allow_external_paths = os.getenv("SHORTS_ALLOW_EXTERNAL_PATHS", "false").strip(
 _rate_limit_per_minute = _positive_int_env("SHORTS_RATE_LIMIT_PER_MINUTE", 600)
 _upload_rate_limit_per_minute = _positive_int_env("SHORTS_UPLOAD_RATE_LIMIT_PER_MINUTE", 10)
 _job_rate_limit_per_minute = _positive_int_env("SHORTS_JOB_RATE_LIMIT_PER_MINUTE", 30)
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_job_rate_limit_paths = {
+    "/api/jobs",
+    "/api/jobs/batch",
+    "/api/factory/jobs",
+}
+# Retry re-runs a full render, so it must count against the same job budget.
+# Only mutations spend that budget: the reads under these paths are the
+# progress poll, the SSE stream and the project list, so charging them here
+# would throttle ordinary browsing against the much smaller job limit.
+_job_rate_limit_path_prefixes = ("/api/jobs/",)
+_job_rate_limit_excluded_path_prefixes = ("/api/jobs/clip/", "/api/jobs/thumbnail/", "/api/jobs/waveform/")
 _rate_limiter = make_rate_limiter(_rate_limit_per_minute, name="general")
 _upload_rate_limiter = make_rate_limiter(_upload_rate_limit_per_minute, name="upload")
 _job_rate_limiter = make_rate_limiter(_job_rate_limit_per_minute, name="job")
 _job_executor: Optional[ThreadPoolExecutor] = None
 _job_futures: Dict[str, Future[Any]] = {}
+_max_queued_jobs = _positive_int_env("SHORTS_MAX_QUEUED_JOBS", 64)
+# In-flight budget for renders: running workers plus queued submissions. Each
+# queued or running render holds one permit, so a burst of requests can never
+# buffer an unbounded number of pending jobs in process memory.
+_job_queue_slots = threading.BoundedSemaphore(_max_concurrent_jobs + _max_queued_jobs)
 _process_lock = threading.RLock()
 _job_processes: Dict[str, Dict[int, Any]] = {}
 _shutdown_requested = threading.Event()
@@ -449,29 +472,49 @@ async def security_middleware(request: Request, call_next: Any):
     """Protect remote deployments and throttle expensive local endpoints.
 
     Authentication is opt-in through ``SHORTS_API_TOKEN`` so the packaged
-    loopback desktop experience remains one-click.  Once configured, every
-    API route except health/login/status requires a bearer header, token header,
-    or the secure session cookie issued by ``/api/auth/login``.
+    loopback desktop experience remains one-click; see the startup guard in
+    :func:`_validate_remote_security_configuration` which refuses to serve a
+    non-loopback bind without a token.  Once configured, every API route
+    except health/login/status requires a bearer header, the ``X-Shorts-Token``
+    header, or the HttpOnly session cookie issued by ``/api/auth/login``.
+    Cookie-authenticated mutations must additionally pass the same-origin
+    (Origin/Referer) and CSRF double-submit checks below.
     """
     path = request.url.path
     public = path in {"/api/health", "/healthz", "/api/auth/status", "/api/auth/login"} or not path.startswith("/api/")
     if auth_enabled() and not public and not authorized(request):
         return error_response("Authentication required", "auth_required", 401)
-    if auth_enabled() and request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"} and request.cookies.get("shorts_token"):
-        origin = request.headers.get("origin") or request.headers.get("referer")
-        # SameSite=Strict is the primary protection; this origin check covers
-        # deployments that place the UI behind a reverse proxy.
-        if origin:
-            parsed_origin = urlparse(origin)
-            if parsed_origin.netloc and parsed_origin.netloc != request.url.netloc:
-                return error_response("Cross-site mutation blocked", "csrf_failed", 403)
+    if (
+        auth_enabled()
+        and request.method.upper() in _MUTATING_METHODS
+        and request.cookies.get("shorts_token")
+        # Bearer-authenticated callers are not cookie-authenticated and stay
+        # exempt from the browser-focused CSRF controls.
+        and not bearer_authorized(request)
+    ):
+        if not is_safe_request_origin(request):
+            return error_response("Cross-site mutation blocked", "csrf_failed", 403)
+        submitted = request.headers.get("x-csrf-token", "").strip()
+        cookie_csrf = str(request.cookies.get("shorts_csrf") or "")
+        if not submitted or not hmac.compare_digest(submitted, cookie_csrf):
+            return error_response("Cross-site mutation blocked", "csrf_failed", 403)
     if path.startswith("/api/") and path not in {"/api/health", "/api/auth/status"}:
         limiter = _rate_limiter
         limit = None
+        # Rate limiting runs before the /api/v1 rewrite middleware, so
+        # versioned paths are normalised to their legacy equivalents here.
+        if path.startswith("/api/v1/"):
+            path = "/api" + path[len("/api/v1") :]
         if path == "/api/uploads":
             limiter = _upload_rate_limiter
             limit = _upload_rate_limit_per_minute
-        elif path in {"/api/jobs", "/api/jobs/batch"}:
+        elif request.method.upper() in _MUTATING_METHODS and (
+            path in _job_rate_limit_paths
+            or (
+                path.startswith(_job_rate_limit_path_prefixes)
+                and not path.startswith(_job_rate_limit_excluded_path_prefixes)
+            )
+        ):
             limiter = _job_rate_limiter
             limit = _job_rate_limit_per_minute
         allowed, retry_after = limiter.allow(f"{client_key(request)}:{path}", limit)
@@ -616,13 +659,21 @@ def _job_path(job_id: str) -> Path:
 def _persist_job_locked(job: Dict[str, Any]) -> None:
     """Persist one job atomically to SQLite and a portable JSON mirror.
 
-    SQLite is the durable queue/state source.  JSON remains intentionally
+    Request URLs are scrubbed of credential-looking query parameters before
+    anything touches disk: signed media links and OAuth values have no
+    business outliving the request that produced them.  SQLite is the durable
+    queue/state source.  JSON remains intentionally
     available for human inspection and the metadata backup format.
     """
     _jobs_dir.mkdir(parents=True, exist_ok=True)
     _job_store.reopen()
     job["schema_version"] = _JOB_SCHEMA_VERSION
     job["updated_at"] = time.time()
+    request_value = job.get("request")
+    if isinstance(request_value, dict):
+        url_value = request_value.get("url")
+        if isinstance(url_value, str) and "://" in url_value:
+            request_value["url"] = redact_url_query(url_value)
     _job_store.save(job)
     path = _job_path(str(job["id"]))
     temporary = path.with_suffix(".json.tmp")
@@ -1232,7 +1283,13 @@ def _validate_local_paths(req: JobRequest) -> None:
 
 
 def _ensure_job_executor() -> ThreadPoolExecutor:
-    """Create the bounded worker pool lazily so TestClient and restarts recover."""
+    """Create the bounded worker pool lazily so TestClient and restarts recover.
+
+    Queue capacity itself is bounded by the ``_job_queue_slots`` semaphore in
+    :func:`_start_job_thread`: a submission only proceeds while the combined
+    running-plus-queued budget has room, so the executor's internal queue can
+    never grow without bound.
+    """
     global _job_executor
     if _job_executor is None:
         _job_executor = ThreadPoolExecutor(max_workers=_max_concurrent_jobs, thread_name_prefix="shorts-studio-job")
@@ -1310,17 +1367,68 @@ def _start_job_thread(
     job_id: str,
     req: JobRequest,
     credentials: Optional[Dict[str, str]] = None,
+    *,
+    cleanup_on_reject: bool = False,
 ) -> None:
-    future = _ensure_job_executor().submit(_run_job, job_id, req, dict(credentials or {}))
+    """Submit one render to the bounded worker pool.
+
+    The caller has already persisted the job record, so a rejected submission
+    must leave no permanently stuck record behind: the in-memory entry is
+    reverted to ``error`` (and optionally removed) and the queue slot is
+    released. ``cleanup_on_reject`` is set by the create/batch/retry paths
+    where the job has never run, while the resume path keeps the record with
+    a visible error so the user can inspect and retry it.
+    """
+    # Reserve an in-flight slot before enqueueing. The bounded wait rejects
+    # sustained overload quickly instead of buffering renders indefinitely.
+    if not _job_queue_slots.acquire(timeout=2.0):
+        _mark_submission_rejected(job_id, cleanup_on_reject=cleanup_on_reject)
+        raise HTTPException(429, "Too many queued projects; wait for current renders to finish")
+    try:
+        future = _ensure_job_executor().submit(_run_job, job_id, req, dict(credentials or {}))
+    except RuntimeError:
+        _job_queue_slots.release()
+        _mark_submission_rejected(job_id, cleanup_on_reject=cleanup_on_reject)
+        raise HTTPException(429, "Too many queued projects; wait for current renders to finish") from None
+
     with _lock:
         _job_futures[job_id] = future
 
     def clear_finished(_future: Future[Any]) -> None:
+        _job_queue_slots.release()
         with _lock:
             if _job_futures.get(job_id) is _future:
                 _job_futures.pop(job_id, None)
 
     future.add_done_callback(clear_finished)
+
+
+def _mark_submission_rejected(job_id: str, *, cleanup_on_reject: bool) -> None:
+    """Unstick a job record whose render could not be queued."""
+    with _lock:
+        job = _jobs.get(job_id)
+        if cleanup_on_reject:
+            _jobs.pop(job_id, None)
+            _cancel_events.pop(job_id, None)
+            _job_credentials.pop(job_id, None)
+            _job_futures.pop(job_id, None)
+            try:
+                _job_store.delete(job_id)
+            except (OSError, ValueError, RuntimeError):
+                pass
+            try:
+                _job_path(job_id).unlink(missing_ok=True)
+            except (OSError, ValueError, RuntimeError):
+                pass
+            return
+        if job is not None:
+            job["status"] = "error"
+            job["stage"] = "error"
+            message = "Render could not be queued; the project queue is full. Retry later."
+            job["message"] = message
+            job["error"] = message
+            _append_job_log(job, "error", message)
+            _persist_job_locked(job)
 
 
 def _run_job(
@@ -1575,6 +1683,10 @@ def _enqueue_job(
         raise HTTPException(
             507, f"not enough free disk space ({free_gb:.2f} GB available; {_min_free_gb:.2f} GB required)"
         )
+    # Strip credential-bearing query parameters (signed media URLs, OAuth
+    # callbacks) before the URL is persisted, displayed, or used as a name.
+    if "://" in req.url:
+        req.url = redact_url_query(req.url.strip())
     job_id = uuid.uuid4().hex[:12]
     default_name = re.sub(r"[^A-Za-z0-9 _-]+", " ", req.url.rsplit("/", 1)[-1]).strip()
     default_name = " ".join(default_name.split())[:80] or "Untitled project"
@@ -1656,7 +1768,7 @@ def _enqueue_job(
         if supplied_credentials:
             _job_credentials[job_id] = supplied_credentials
         _persist_job_locked(_jobs[job_id])
-    _start_job_thread(job_id, req, supplied_credentials)
+    _start_job_thread(job_id, req, supplied_credentials, cleanup_on_reject=True)
     with _lock:
         return _job_snapshot(_jobs[job_id])
 
@@ -1699,7 +1811,7 @@ def _resume_interrupted_jobs() -> None:
             _persist_job_locked(job)
             pending.append((job_id, req))
     for job_id, req in pending:
-        _start_job_thread(job_id, req)
+        _start_job_thread(job_id, req, cleanup_on_reject=False)
 
 
 
@@ -1982,6 +2094,34 @@ def _select_release_asset(release: Dict[str, Any]) -> Optional[Dict[str, str]]:
 
 def _release_info(release: Dict[str, Any]) -> Dict[str, Any]:
     return _update_service.release_info(release)
+
+
+def _validate_remote_security_configuration() -> None:
+    """Refuse to serve a non-loopback bind without authentication configured.
+
+    The packaged desktop experience binds to ``127.0.0.1`` and intentionally
+    works without a token.  Container and Helm deployments expose the port to
+    the network, so they must fail closed at startup when ``SHORTS_API_TOKEN``
+    is missing.  Deployments that terminate TLS in front of the app can set
+    ``SHORTS_TRUSTED_PROXIES``; anything that reaches the app on a plaintext
+    loopback bind in that setup still requires the token because the app
+    itself is the trust boundary for API access.
+    """
+    host = os.getenv("SHORTS_BIND_HOST", "127.0.0.1").strip().lower()
+    if host in {"", "localhost"} or host_is_loopback(host):
+        return
+    if auth_enabled():
+        return
+    if os.getenv("SHORTS_ALLOW_UNAUTHENTICATED_REMOTE", "").strip().lower() in {"1", "true", "yes", "on"}:
+        _logger.warning(
+            "SHORTS_ALLOW_UNAUTHENTICATED_REMOTE is enabled: the API on %s accepts unauthenticated requests", host
+        )
+        return
+    raise RuntimeError(
+        "Refusing to start: binding to a non-loopback address without SHORTS_API_TOKEN "
+        "exposes every project and credential-redaction bypass to the network. "
+        "Set SHORTS_API_TOKEN (recommended) or bind to 127.0.0.1."
+    )
 
 
 def _set_update_state(**values: Any) -> Dict[str, Any]:

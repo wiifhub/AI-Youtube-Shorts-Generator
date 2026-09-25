@@ -24,6 +24,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 FROM python:3.12-slim-bookworm AS runtime
 
+# Declares the network-exposed bind so the app refuses to start without
+# SHORTS_API_TOKEN instead of silently serving an open API.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -35,7 +37,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     XDG_CACHE_HOME=/data/cache \
     SHORTS_STUDIO_HEADLESS=true \
     SHORTS_STUDIO_BROWSER=true \
-    SHORTS_PORT=7860
+    SHORTS_PORT=7860 \
+    SHORTS_BIND_HOST=0.0.0.0
 
 WORKDIR /app
 
@@ -66,3 +69,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/api/health', timeout=3).read()" || exit 1
 
 CMD ["python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "7860"]
+# The startup guard reads SHORTS_BIND_HOST and refuses unauthenticated
+# non-loopback binds; set SHORTS_API_TOKEN to run the container.

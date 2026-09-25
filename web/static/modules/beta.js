@@ -99,8 +99,7 @@
       const key = platform?.value === 'instagram_reels' ? 'instagram' : 'tiktok';
       try {
         const data = await request(`/api/v1/${key}/oauth/start`);
-        const opened = window.open(data.authorization_url, '_blank', 'noopener,noreferrer');
-        if (!opened) window.location.href = data.authorization_url;
+        window.ShortsStudioUI.safeOpen(data.authorization_url, status);
         status(`Authorize ${key === 'instagram' ? 'Instagram' : 'TikTok'} in the consent window, then return here.`);
       } catch (error) { status(error.message); }
     });

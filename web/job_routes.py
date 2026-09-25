@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 
 from web.models import BatchRequest, JobRequest, ProjectUpdate
@@ -75,21 +75,49 @@ def create_factory_job(
 @router.post("/api/jobs/batch")
 def create_batch_jobs(
     req: BatchRequest,
+    request: Request,
     x_muapi_key: Optional[str] = Header(default=None, alias="X-MuAPI-Key"),
     x_openai_key: Optional[str] = Header(default=None, alias="X-OpenAI-Key"),
     x_gemini_key: Optional[str] = Header(default=None, alias="X-Gemini-Key"),
     x_llm_provider: Optional[str] = Header(default=None, alias="X-LLM-Provider"),
 ) -> Dict[str, Any]:
+    """Enqueue one render per URL.
+
+    Each enqueued job is counted against the caller's job rate-limit bucket so
+    a small batch limit cannot be multiplied into an unlimited queue by
+    repeated requests.  The batch is validated against the remaining budget
+    up front so a request never partially enqueues and then aborts mid-way.
+    """
     studio = _studio()
     credentials = _credentials(x_muapi_key, x_openai_key, x_gemini_key, x_llm_provider)
+    usable = [str(url).strip() for url in req.urls if len(str(url).strip()) >= 3]
+    if not usable:
+        raise HTTPException(400, "batch did not contain any usable URLs or file paths")
+    bucket = f"{studio.client_key(request)}:/api/jobs"
+    limiter = studio._job_rate_limiter
+    limit = studio._job_rate_limit_per_minute
+    remaining = limiter.remaining(bucket, limit)
+    if remaining < len(usable):
+        raise HTTPException(
+            429,
+            f"Batch of {len(usable)} projects exceeds the remaining job budget of {remaining} for this minute",
+        )
     jobs = []
     defaults = req.model_dump()
     defaults.pop("urls", None)
-    for url in req.urls:
-        clean_url = str(url).strip()
-        if len(clean_url) < 3:
-            continue
-        payload = {**defaults, "url": clean_url}
+    for url in usable:
+        # Authoritative per-URL accounting in the same bucket the middleware
+        # uses for single job creation, so batches cannot multiply the quota.
+        allowed, _retry_after = limiter.allow(bucket, limit)
+        if not allowed:
+            # Only reachable under concurrent writes; already-enqueued jobs
+            # stay queued and are visible in the project library.
+            raise HTTPException(
+                429,
+                f"Job budget was exhausted mid-batch after {len(jobs)} projects; "
+                "retry the remaining URLs later",
+            )
+        payload = {**defaults, "url": url}
         jobs.append(studio._enqueue_job(JobRequest.model_validate(payload), credentials))
     if not jobs:
         raise HTTPException(400, "batch did not contain any usable URLs or file paths")
@@ -348,7 +376,7 @@ def retry_job(
             studio._job_credentials[job_id] = credentials
         studio._persist_job_locked(job)
         snapshot = studio._job_snapshot(job)
-    studio._start_job_thread(job_id, req, credentials)
+    studio._start_job_thread(job_id, req, credentials, cleanup_on_reject=True)
     return snapshot
 
 

@@ -35,7 +35,14 @@ def test_healthz_is_non_disclosing_and_security_headers_are_present(client) -> N
 
 def test_cookie_authenticated_cross_site_mutation_is_blocked(client, monkeypatch) -> None:
     monkeypatch.setenv("SHORTS_API_TOKEN", "csrf-test-token")
-    assert client.post("/api/auth/login", json={"token": "csrf-test-token"}).status_code == 200
+    login = client.post("/api/auth/login", json={"token": "csrf-test-token"})
+    assert login.status_code == 200
+    csrf_token = client.cookies.get("shorts_csrf")
+    assert csrf_token
+    # The session cookie must not contain (or equal) the configured token.
+    assert "csrf-test-token" not in client.cookies.get("shorts_token", "")
+
+    # Cross-site mutation: rejected by the Origin check.
     blocked = client.post(
         "/api/setup/dismiss",
         headers={"Origin": "https://evil.example"},
@@ -43,6 +50,23 @@ def test_cookie_authenticated_cross_site_mutation_is_blocked(client, monkeypatch
     )
     assert blocked.status_code == 403
     assert blocked.json()["code"] == "csrf_failed"
+
+    # Same-origin but missing CSRF token: rejected by the double-submit check.
+    blocked = client.post(
+        "/api/setup/dismiss",
+        headers={"Origin": "http://testserver"},
+        json={"dismissed": True},
+    )
+    assert blocked.status_code == 403
+    assert blocked.json()["code"] == "csrf_failed"
+
+    # Same-origin with the matching CSRF token: accepted.
+    allowed = client.post(
+        "/api/setup/dismiss",
+        headers={"Origin": "http://testserver", "X-CSRF-Token": csrf_token},
+        json={"dismissed": True},
+    )
+    assert allowed.status_code == 200
 
 
 def test_backup_safe_url_helper_removes_signed_media_links() -> None:

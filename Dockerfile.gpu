@@ -1,5 +1,7 @@
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
+# Declares the network-exposed bind so the app refuses to start without
+# SHORTS_API_TOKEN instead of silently serving an open API.
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -12,24 +14,30 @@ ENV DEBIAN_FRONTEND=noninteractive \
     SHORTS_STUDIO_HEADLESS=true \
     LOCAL_WHISPER_DEVICE=cuda \
     SHORTS_STUDIO_BROWSER=true \
-    SHORTS_PORT=7860
+    SHORTS_PORT=7860 \
+    SHORTS_BIND_HOST=0.0.0.0
 
 WORKDIR /app
 
 # The CUDA image supplies the GPU runtime. Node 20 is used for yt-dlp's
 # optional YouTube challenge runtime; FFmpeg and OpenCV runtime libraries are
-# still needed for the render pipeline.
+# still needed for the render pipeline.  Node is installed from the NodeSource
+# repository using its signed key fetched at build time (no ``curl | bash``).
 RUN apt-get update \
     && apt-get install --no-install-recommends -y \
         ca-certificates \
         curl \
+        gnupg \
         ffmpeg \
         libgl1 \
         libglib2.0-0 \
         python3 \
         python3-dev \
         python3-pip \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
     && apt-get install --no-install-recommends -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
@@ -38,7 +46,11 @@ RUN python3 -m pip install --upgrade pip \
     && python3 -m pip install --no-cache-dir -r requirements-docker.txt \
     && python3 -m pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu124 "torch==2.14.0"
 
-COPY . .
+# Only the runtime source is shipped; tests, CI config, release material,
+# and local working files stay out of the image.
+COPY shorts_generator ./shorts_generator
+COPY web ./web
+COPY pyproject.toml README.md LICENSE ./
 RUN mkdir -p /data/output /data/cache /data/models \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin shorts \
     && chown -R shorts:shorts /app /data
@@ -50,3 +62,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/api/health', timeout=3).read()" || exit 1
 
 CMD ["python3", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "7860"]
+# The startup guard reads SHORTS_BIND_HOST and refuses unauthenticated
+# non-loopback binds; set SHORTS_API_TOKEN to run the container.

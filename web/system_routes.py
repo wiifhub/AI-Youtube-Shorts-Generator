@@ -11,7 +11,6 @@ from __future__ import annotations
 import hmac
 import importlib
 import os
-import secrets
 import shutil
 import subprocess
 import sys
@@ -26,7 +25,17 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from shorts_generator.config import PipelineConfig
 from web.models import AuthLogin, OpenFolderRequest, SetupStateUpdate
-from web.security import LoginAttemptLimiter, authorized, auth_enabled, client_key, configured_token, error_response, redact_text
+from web.security import (
+    LoginAttemptLimiter,
+    authorized,
+    auth_enabled,
+    client_key,
+    configured_token,
+    error_response,
+    issue_session_token,
+    redact_text,
+    session_cookie_secure,
+)
 from web.api_contract import API_VERSION, ERROR_CATALOG
 
 
@@ -67,16 +76,29 @@ def auth_login(request: Request, credentials: AuthLogin) -> JSONResponse:
             response.headers["Retry-After"] = str(retry_after)
         return response
     _login_attempts.success(key)
+    # The configured token itself is never stored in the browser: the cookie
+    # carries a random session value whose digest is bound to the active
+    # token, so a stolen cookie cannot be replayed as a bearer credential and
+    # rotating SHORTS_API_TOKEN revokes issued sessions immediately.
+    cookie_value, csrf_token, max_age = issue_session_token()
+    secure = session_cookie_secure(request)
     response = JSONResponse({"status": "authenticated"})
     response.set_cookie(
         "shorts_token",
-        credentials.token,
-        max_age=86400,
+        cookie_value,
+        max_age=max_age,
         httponly=True,
-        secure=request.url.scheme == "https",
+        secure=secure,
         samesite="strict",
     )
-    response.set_cookie("shorts_csrf", secrets.token_urlsafe(24), max_age=86400, httponly=False, secure=request.url.scheme == "https", samesite="strict")
+    response.set_cookie(
+        "shorts_csrf",
+        csrf_token,
+        max_age=max_age,
+        httponly=False,
+        secure=secure,
+        samesite="strict",
+    )
     return response
 
 

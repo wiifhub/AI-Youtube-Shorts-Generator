@@ -179,8 +179,12 @@ class JobRequest(StrictModel):
 
 
 class BatchRequest(JobRequest):
+    # Each URL becomes one enqueued render, so the request cost scales with
+    # the list length. The cap keeps one request from flooding the render
+    # queue; per-URL accounting is enforced against the job rate limiter in
+    # the batch handler.
     url: str = ""
-    urls: List[str] = Field(..., min_length=1, max_length=50)
+    urls: List[str] = Field(..., min_length=1, max_length=10)
 
 
 class ClipUpdate(StrictModel):
