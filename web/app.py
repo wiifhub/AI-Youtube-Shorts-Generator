@@ -76,11 +76,12 @@ from web.security import (  # noqa: E402
     client_key,
     error_response,
     host_is_loopback,
-    is_job_budget_request,
     is_safe_request_origin,
+    job_budget_bucket,
     make_rate_limiter,
     rate_limit_key,
     rate_limit_response,
+    rate_limit_shape,
     redact_record_urls,
     redact_structure,
     redact_text,
@@ -509,12 +510,18 @@ async def security_middleware(request: Request, call_next: Any):
         # versioned paths are normalised to their legacy equivalents here.
         if path.startswith("/api/v1/"):
             path = "/api" + path[len("/api/v1") :]
+        # Every bucket is the route shape, never the concrete URL, so a project
+        # id cannot act as a multiplier for expensive work.
+        bucket = rate_limit_shape(path)
         if path == "/api/uploads":
             limiter = _upload_rate_limiter
             limit = _upload_rate_limit_per_minute
-        elif is_job_budget_request(request.method, path):
-            limiter, limit = _job_budget()
-        allowed, retry_after = limiter.allow(rate_limit_key(client_key(request), path), limit)
+        else:
+            job_bucket = job_budget_bucket(request.method, path)
+            if job_bucket is not None:
+                limiter, limit = _job_budget()
+                bucket = job_bucket
+        allowed, retry_after = limiter.allow(rate_limit_key(client_key(request), bucket), limit)
         if not allowed:
             return rate_limit_response(retry_after)
     response = await call_next(request)

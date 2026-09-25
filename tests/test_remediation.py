@@ -10,18 +10,25 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import threading
 import time
 import zipfile
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 import web.app as studio
+from shorts_generator.local import clipper
 from web import feature_routes
 from web.security import (
+    JOB_SUBMISSION_PATH,
+    MUTATING_METHODS,
     SlidingWindowLimiter,
     issue_session_token,
+    job_budget_bucket,
+    rate_limit_shape,
     redact_record_urls,
     redact_text,
     redact_url_query,
@@ -569,6 +576,230 @@ def test_library_refresh_does_not_drain_the_batch_budget(
     )
     assert response.status_code == 200
     assert len(response.json()["jobs"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# The render budget is keyed by route shape, not by the concrete URL
+# ---------------------------------------------------------------------------
+
+
+def _widen_budgets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Setup work should not spend the budget under test."""
+    monkeypatch.setattr(studio, "_rate_limiter", SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "_upload_rate_limiter", SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "_job_rate_limiter", SlidingWindowLimiter(limit=1000, window_seconds=60))
+    monkeypatch.setattr(studio, "_job_rate_limit_per_minute", 1000)
+    monkeypatch.setattr(studio, "MUAPI_API_KEY", "mu_test_key_1234567890")
+
+
+def _tighten_render_budget(monkeypatch: pytest.MonkeyPatch, limit: int = 1) -> None:
+    monkeypatch.setattr(studio, "_job_rate_limiter", SlidingWindowLimiter(limit=limit, window_seconds=60))
+    monkeypatch.setattr(studio, "_job_rate_limit_per_minute", limit)
+
+
+def _record_started(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Record every render that actually reaches the worker."""
+    started: list = []
+    monkeypatch.setattr(
+        studio,
+        "_start_job_thread",
+        lambda job_id, req, *args, **kwargs: started.append((job_id, req.url)),
+    )
+    return started
+
+
+def _park_retryable_projects(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, started: list, count: int
+) -> list:
+    """Create real API-mode projects through the endpoint, then park them failed."""
+    _widen_budgets(monkeypatch)
+    job_ids = []
+    for index in range(count):
+        response = client.post("/api/jobs", json={"url": f"https://youtu.be/aBcD{index:04d}", "mode": "api"})
+        assert response.status_code == 200, response.text
+        job_ids.append(response.json()["id"])
+    with studio._lock:
+        for job_id in job_ids:
+            job = studio._jobs[job_id]
+            job["status"] = "error"
+            job["stage"] = "error"
+            studio._persist_job_locked(job)
+    started.clear()
+    return job_ids
+
+
+def _local_project(client: TestClient, monkeypatch: pytest.MonkeyPatch, index: int) -> str:
+    """One local-mode project whose source file really exists inside the output.
+
+    The projects exist to exercise the editor routes, not to render, so the
+    worker is parked and the fake source is never handed to the pipeline.
+    """
+    _widen_budgets(monkeypatch)
+    monkeypatch.setattr(studio, "_start_job_thread", lambda *_args, **_kwargs: None)
+    source = studio._uploads_dir / f"budget-shape-{index}.mp4"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"not really a video")
+    response = client.post("/api/jobs", json={"url": str(source), "mode": "local"})
+    assert response.status_code == 200, response.text
+    job_id = response.json()["id"]
+    with studio._lock:
+        job = studio._jobs[job_id]
+        job["status"] = "done"
+        job["stage"] = "done"
+        job["raw_source_video_url"] = str(source)
+        studio._persist_job_locked(job)
+    return job_id
+
+
+def _middleware_path(path: str) -> str:
+    """The path the limiter sees: the middleware rewrites /api/v1 to /api."""
+    if path.startswith("/api/v1/"):
+        return "/api" + path[len("/api/v1") :]
+    return path
+
+
+def _concrete_route(path: str, job_id: str) -> str:
+    """Fill a registered route template with a project id and dummy parameters."""
+    return (
+        _middleware_path(path).replace("{job_id}", job_id)
+        .replace("{index}", "3")
+        .replace("{filename}", "clip.mp4")
+        .replace("{name}", "preset")
+        .replace("{variant_id}", "abc123def456")
+    )
+
+
+def test_no_mutating_route_keys_its_budget_on_the_project_id() -> None:
+    """A bucket built from the URL hands every project a private quota.
+
+    This walks the registered route table instead of a hand-written list, so a
+    route added later cannot quietly reintroduce the multiplier: two different
+    projects hitting the same route must land in the same bucket.
+    """
+    paths = studio.app.openapi()["paths"]
+    assert paths, "route table is empty"
+    checked = 0
+    for path, operations in paths.items():
+        for method in operations:
+            if method.upper() not in MUTATING_METHODS:
+                continue
+            first = job_budget_bucket(method.upper(), _concrete_route(path, "aBcD1234ef56"))
+            second = job_budget_bucket(method.upper(), _concrete_route(path, "zzTt99887766"))
+            assert first == second, f"{method.upper()} {path} keys its render budget on the project id"
+            first_shape = rate_limit_shape(_concrete_route(path, "aBcD1234ef56"))
+            second_shape = rate_limit_shape(_concrete_route(path, "zzTt99887766"))
+            assert first_shape == second_shape, f"{method.upper()} {path} is limiter-bucketed per project"
+            checked += 1
+    assert checked > 20
+
+
+def test_limiter_buckets_are_route_shapes_not_concrete_urls() -> None:
+    """A read that runs ffmpeg must not get a private quota per project either."""
+    assert rate_limit_shape("/api/jobs/aBcD1234ef56/waveform") == "/api/jobs/{job_id}/waveform"
+    assert rate_limit_shape("/api/jobs/zzTt99887766/waveform") == "/api/jobs/{job_id}/waveform"
+    assert rate_limit_shape("/api/jobs/aBcD1234ef56/clips/3") == "/api/jobs/{job_id}/clips/{index}"
+    assert rate_limit_shape("/api/jobs/zzTt99887766/clips/9") == "/api/jobs/{job_id}/clips/{index}"
+    assert rate_limit_shape("/api/jobs/aBcD1234ef56") == "/api/jobs/{job_id}"
+    # Paths with no per-project id are their own shape.
+    assert rate_limit_shape("/api/jobs") == "/api/jobs"
+    assert rate_limit_shape("/api/storage") == "/api/storage"
+    assert rate_limit_shape("/api/uploads") == "/api/uploads"
+
+
+def test_job_budget_buckets_are_the_route_shapes() -> None:
+    """The shapes that exist, and the ones that do not, decide the budget."""
+    assert job_budget_bucket("POST", "/api/jobs") == JOB_SUBMISSION_PATH
+    assert job_budget_bucket("POST", "/api/factory/jobs") == JOB_SUBMISSION_PATH
+    # The batch handler spends one submission slot per URL itself, so the
+    # middleware keeps it on its own request bucket rather than double-charging.
+    assert job_budget_bucket("POST", "/api/jobs/batch") == "/api/jobs/batch"
+    # A retry starts a render, so it spends the shared submission slot.
+    assert job_budget_bucket("POST", "/api/jobs/aBcD1234ef56/retry") == JOB_SUBMISSION_PATH
+    assert job_budget_bucket("POST", "/api/jobs/aBcD1234ef56/clips/3") == "/api/jobs/{job_id}/clips/{index}"
+    assert job_budget_bucket("POST", "/api/jobs/zzTt99887766/clips/9") == "/api/jobs/{job_id}/clips/{index}"
+    assert job_budget_bucket("POST", "/api/jobs/aBcD1234ef56/preview") == "/api/jobs/{job_id}/preview"
+    # Reads never spend the render budget, and neither does an unrelated route.
+    assert job_budget_bucket("GET", "/api/jobs/aBcD1234ef56/preview") is None
+    assert job_budget_bucket("POST", "/api/open-folder") is None
+
+
+def test_a_retry_spends_the_shared_render_slot_not_a_private_one(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retry starts a render, so N failed projects must not start N renders."""
+    started = _record_started(monkeypatch)
+    job_ids = _park_retryable_projects(client, monkeypatch, started, 3)
+    _tighten_render_budget(monkeypatch)
+
+    codes = [client.post(f"/api/jobs/{job_id}/retry").status_code for job_id in job_ids]
+    assert codes == [200, 429, 429]
+    assert len(started) == 1
+
+
+def test_a_create_and_a_retry_compete_for_the_same_render_slot(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The policy says retry spends the slots a plain create would."""
+    started = _record_started(monkeypatch)
+    job_ids = _park_retryable_projects(client, monkeypatch, started, 1)
+    _tighten_render_budget(monkeypatch)
+
+    assert client.post("/api/jobs", json={"url": "https://youtu.be/slot0001", "mode": "api"}).status_code == 200
+    assert client.post("/api/jobs", json={"url": "https://youtu.be/slot0002", "mode": "api"}).status_code == 429
+
+    started.clear()
+    assert client.post(f"/api/jobs/{job_ids[0]}/retry").status_code == 429
+    assert started == []
+
+
+def test_waveform_read_does_not_get_a_private_quota_per_project(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The waveform GET runs ffmpeg, so it must share one bucket too."""
+    calls: list = []
+
+    def fake_media_command(job_id: str, args: list, timeout: float = 90.0) -> object:
+        calls.append(job_id)
+        return subprocess.CompletedProcess(args, 0, b"\x00\x40" * 400, b"")
+
+    monkeypatch.setattr(studio, "_run_media_command", fake_media_command)
+    job_ids = [_local_project(client, monkeypatch, index) for index in range(2)]
+    monkeypatch.setattr(studio, "_rate_limiter", SlidingWindowLimiter(limit=2, window_seconds=60))
+
+    # A new ``bins`` value misses the cache, so each accepted request is a
+    # second ffmpeg run rather than a served file.
+    codes = [
+        client.get(f"/api/jobs/{job_ids[0]}/waveform", params={"bins": bins}).status_code
+        for bins in (32, 64, 96)
+    ]
+    codes.append(client.get(f"/api/jobs/{job_ids[1]}/waveform", params={"bins": 32}).status_code)
+    assert codes == [200, 200, 429, 429]
+    assert len(calls) == 2
+
+
+def test_ffmpeg_draft_work_does_not_multiply_the_budget_by_project(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preview per project would otherwise be three ffmpeg runs per budget."""
+    renders: list = []
+
+    def fake_crop(*args: object, **_kwargs: object) -> None:
+        renders.append(args[4])
+        Path(str(args[4])).write_bytes(b"preview")
+
+    monkeypatch.setattr(clipper, "crop_clip_local", fake_crop)
+    job_ids = [_local_project(client, monkeypatch, index) for index in range(3)]
+    _tighten_render_budget(monkeypatch)
+
+    codes = [
+        client.post(
+            f"/api/jobs/{job_id}/preview",
+            json={"start_time": 0.0, "end_time": 1.5, "caption_style": "bold"},
+        ).status_code
+        for job_id in job_ids
+    ]
+    assert codes == [200, 429, 429]
+    assert len(renders) == 1
 
 
 # ---------------------------------------------------------------------------

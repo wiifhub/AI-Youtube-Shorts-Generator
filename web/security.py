@@ -610,10 +610,14 @@ def client_key(request: Request) -> str:
 # Render (job) rate-limit budget
 #
 # One owner for the policy: which requests spend the render budget and how they
-# are keyed.  The HTTP middleware charges a request against its own path while
-# batch accounting deliberately spends the canonical per-render bucket, so a
-# batch of N consumes N single-job slots.  Keeping the classification and the
-# key construction together means a change lands in exactly one place.
+# are keyed.  Batch accounting deliberately spends the canonical per-render
+# bucket, so a batch of N consumes N single-job slots, while the middleware
+# charges one slot per submission route.  Every bucket is a route *shape*
+# (:func:`rate_limit_shape`) rather than a concrete URL, because a key that
+# carries a project id hands every project its own quota and lets one minute of
+# limit be multiplied by however many projects exist.  Keeping the
+# classification and the key construction together means a change lands in
+# exactly one place.
 # ---------------------------------------------------------------------------
 
 MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -621,24 +625,65 @@ MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 #: the same slots a plain job create would.
 JOB_SUBMISSION_PATH = "/api/jobs"
 
-_JOB_BUDGET_PATHS = frozenset({"/api/jobs", "/api/jobs/batch", "/api/factory/jobs"})
-_JOB_BUDGET_PATH_PREFIX = "/api/jobs/"
-# Clip/thumbnail/waveform reads are drafts of an existing render, not new work.
-_JOB_BUDGET_EXCLUDED_PREFIXES = ("/api/jobs/clip/", "/api/jobs/thumbnail/", "/api/jobs/waveform/")
+#: Routes the middleware charges one submission slot for.
+_JOB_SUBMISSION_PATHS = frozenset({JOB_SUBMISSION_PATH, "/api/factory/jobs"})
+#: ``/api/jobs/batch`` spends one slot per URL inside its handler, which is the
+#: only place that knows how many URLs a request carries, so the middleware must
+#: not charge the canonical bucket for it as well.
+_JOB_SELF_ACCOUNTED_PATHS = frozenset({"/api/jobs/batch"})
+_JOB_BUDGET_PATH_PREFIX = f"{JOB_SUBMISSION_PATH}/"
+_JOB_BUCKET_PROJECT = "{job_id}"
+_JOB_BUCKET_INDEX = "{index}"
+#: The per-project action that starts a render rather than editing one.
+_JOB_RENDER_ACTION = "/retry"
 
 
-def is_job_budget_request(method: str, path: str) -> bool:
-    """True when this request must be charged against the render budget.
+def _job_bucket_action(action: str) -> str:
+    """Replace the per-project identifiers in an action path with placeholders."""
+    return "/".join(_JOB_BUCKET_INDEX if segment.isdigit() else segment for segment in action.split("/"))
 
-    Only mutations spend it.  The reads under these paths are the progress
-    poll, the SSE stream and the project list, so charging them here would
-    throttle ordinary browsing against the much smaller job limit.
+
+def rate_limit_shape(path: str) -> str:
+    """Return the limiter bucket for a path: its route shape, never its ids.
+
+    Two projects hitting one route are the same action on different records, so
+    they share one quota.  Keying on the concrete URL instead gave every project
+    - and every clip index - a private one, so work that is expensive per
+    request scaled with how many of them existed: a retry started as many
+    renders as there were failed projects, and the ffmpeg behind the waveform
+    and clip routes did the same.  Paths with no per-project id are their own
+    shape.
+    """
+    if not path.startswith(_JOB_BUDGET_PATH_PREFIX):
+        return path
+    _project, separator, action = path[len(_JOB_BUDGET_PATH_PREFIX) :].partition("/")
+    if not separator or not action:
+        # ``/api/jobs/<project>``: one project record, with no second id to
+        # fold away beyond the one the placeholder replaces.
+        return f"{_JOB_BUDGET_PATH_PREFIX}{_JOB_BUCKET_PROJECT}"
+    return f"{_JOB_BUDGET_PATH_PREFIX}{_JOB_BUCKET_PROJECT}/{_job_bucket_action(action)}"
+
+
+def job_budget_bucket(method: str, path: str) -> Optional[str]:
+    """Return the canonical render-budget bucket for a request, or ``None``.
+
+    Only mutations spend the budget; the reads under these paths are the
+    progress poll, the SSE stream and the project list, so charging them would
+    throttle ordinary browsing against the much smaller job limit.  The routes
+    handled here are the ones the routers actually register, so a wildcard rule
+    can no longer describe a route that does not exist.  A retry starts a
+    render, so it spends the shared submission slot instead of a private one.
     """
     if str(method).upper() not in MUTATING_METHODS:
-        return False
-    if path in _JOB_BUDGET_PATHS:
-        return True
-    return path.startswith(_JOB_BUDGET_PATH_PREFIX) and not path.startswith(_JOB_BUDGET_EXCLUDED_PREFIXES)
+        return None
+    if path in _JOB_SUBMISSION_PATHS:
+        return JOB_SUBMISSION_PATH
+    if path in _JOB_SELF_ACCOUNTED_PATHS:
+        return path
+    if not path.startswith(_JOB_BUDGET_PATH_PREFIX):
+        return None
+    shape = rate_limit_shape(path)
+    return JOB_SUBMISSION_PATH if shape.endswith(_JOB_RENDER_ACTION) else shape
 
 
 def rate_limit_key(client: str, path: str) -> str:
